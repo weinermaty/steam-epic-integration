@@ -687,20 +687,11 @@ def start_auth(code: str = "") -> dict:
         return {"ok": False, "error": str(exc)}
 
 
-def open_claim_window(target_url: str) -> dict:
-    """
-    Opens a compact GTK+WebKit2 checkout window pre-authenticated with the user's Legendary session!
-    - Exchanges Legendary's game token for a 32-char opaque EPIC_BEARER_TOKEN (without token_type=eg1,
-      so it is 32 bytes instead of 4401 bytes and passes WebKit2's 4096-byte cookie limit).
-    - Sets the HttpOnly cookie via WebKit2.CookieManager, loads store.epicgames.com/en-US/cart to mint
-      the EPIC_EG1 session cookie, and immediately opens the `#/free-checkout` modal ("Add to library").
-    - When the window closes, automatically refreshes Legendary metadata and increments lastClaimTs
-      so the Steam UI immediately adds the newly claimed game to the Steam Library!
-    """
-    if not target_url or "epicgames.com" not in target_url:
-        return {"ok": False, "error": "Invalid store URL"}
+_PREWARMED_CLAIM = {"ts": 0.0, "token": ""}
+_PREWARM_LOCK = threading.Lock()
 
-    short_bearer_token = ""
+
+def _mint_short_bearer_token() -> str:
     try:
         import requests
         from legendary.core import LegendaryCore
@@ -708,7 +699,6 @@ def open_claim_window(target_url: str) -> dict:
         core = LegendaryCore()
         if core.login():
             account_id = core.lgd.userdata.get("account_id", "")
-            # Auto-accept required Epic Store EULAs in the background
             if account_id:
                 for eula_key in ("epicgames_privacy_policy_no_table", "egstore"):
                     try:
@@ -724,7 +714,6 @@ def open_claim_window(target_url: str) -> dict:
                     except Exception:
                         pass
 
-            # Mint 32-char opaque bearer token (fits under 4 KB cookie limit!)
             code = core.egs.get_game_token().get("code", "")
             if code:
                 resp = requests.post(
@@ -737,9 +726,46 @@ def open_claim_window(target_url: str) -> dict:
                     timeout=8,
                 )
                 if resp.status_code == 200:
-                    short_bearer_token = resp.json().get("access_token", "")
+                    return resp.json().get("access_token", "")
     except Exception:
-        short_bearer_token = ""
+        pass
+    return ""
+
+
+def _prewarm_claim_session_async():
+    def _worker():
+        tok = _mint_short_bearer_token()
+        if tok:
+            with _PREWARM_LOCK:
+                _PREWARMED_CLAIM["token"] = tok
+                _PREWARMED_CLAIM["ts"] = time.time()
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def open_claim_window(target_url: str) -> dict:
+    """
+    Opens a compact GTK+WebKit2 checkout window pre-authenticated with the user's Legendary session!
+    - Uses pre-warmed 32-char opaque EPIC_BEARER_TOKEN (0 ms API wait on click) and refreshes
+      the next token asynchronously in the background.
+    - Shows the dark Steam-styled window immediately on click.
+    - If EPIC_EG1 is already cached in webkit_cookies.sqlite, navigates straight to `#/free-checkout`
+      without an extra `/cart` round-trip.
+    """
+    if not target_url or "epicgames.com" not in target_url:
+        return {"ok": False, "error": "Invalid store URL"}
+
+    short_bearer_token = ""
+    with _PREWARM_LOCK:
+        if _PREWARMED_CLAIM["token"] and time.time() - _PREWARMED_CLAIM["ts"] < 1200:
+            short_bearer_token = _PREWARMED_CLAIM["token"]
+            _PREWARMED_CLAIM["token"] = ""
+            _PREWARMED_CLAIM["ts"] = 0.0
+
+    if not short_bearer_token:
+        short_bearer_token = _mint_short_bearer_token()
+
+    # Pre-warm next token for future claims
+    _prewarm_claim_session_async()
 
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":0")
@@ -749,9 +775,10 @@ def open_claim_window(target_url: str) -> dict:
 import os, sys, urllib.request
 import gi
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
 gi.require_version("WebKit2", "4.1")
 gi.require_version("Soup", "3.0")
-from gi.repository import Gtk, WebKit2, Soup, GLib
+from gi.repository import Gtk, Gdk, WebKit2, Soup, GLib
 
 target_url = sys.argv[1]
 short_token = sys.argv[2]
@@ -767,9 +794,12 @@ win.set_default_size(560, 740)
 win.set_position(Gtk.WindowPosition.CENTER)
 
 wv = WebKit2.WebView.new_with_context(ctx)
+wv.set_background_color(Gdk.RGBA(0.09, 0.11, 0.145, 1.0))
 settings = wv.get_settings()
 settings.set_user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 win.add(wv)
+wv.load_html("<html><body style='background:#171d25;color:#8b929a;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'><div>Připravuji pokladnu Epic Games…</div></body></html>", "https://store.epicgames.com/")
+win.show_all()
 
 def notify_claim_done(*_):
     try:
@@ -796,36 +826,47 @@ def poll_cookies():
             if "EPIC_EG1" in names and not navigated["done"]:
                 navigated["done"] = True
                 wv.load_uri(target_url)
-                win.show_all()
                 return
         except Exception:
             pass
         if not navigated["done"]:
-            GLib.timeout_add(600, poll_cookies)
+            GLib.timeout_add(250, poll_cookies)
     cm.get_cookies("https://store.epicgames.com/", None, cb, None)
     return False
 
-if short_token:
-    ck = Soup.Cookie.new("EPIC_BEARER_TOKEN", short_token, ".epicgames.com", "/", 86400)
-    ck.set_secure(True)
-    ck.set_http_only(True)
-    ck.set_same_site_policy(Soup.SameSitePolicy.LAX)
-
-    def on_added(mgr, res, _):
+def start_flow():
+    def on_existing_cookies(mgr, res, _):
         try:
-            mgr.add_cookie_finish(res)
+            cks = mgr.get_cookies_finish(res)
+            if any(x.get_name() == "EPIC_EG1" for x in cks):
+                navigated["done"] = True
+                wv.load_uri(target_url)
+                return
         except Exception:
             pass
-        wv.load_uri("https://store.epicgames.com/en-US/cart")
-        GLib.timeout_add(800, poll_cookies)
-        # Fallback: show window after 4s even if EPIC_EG1 takes longer
-        GLib.timeout_add(4000, lambda: win.show_all() or False)
 
-    cm.add_cookie(ck, None, on_added, None)
-else:
-    wv.load_uri(target_url)
-    win.show_all()
+        if short_token:
+            ck = Soup.Cookie.new("EPIC_BEARER_TOKEN", short_token, ".epicgames.com", "/", 86400)
+            ck.set_secure(True)
+            ck.set_http_only(True)
+            ck.set_same_site_policy(Soup.SameSitePolicy.LAX)
 
+            def on_added(m, r, _u):
+                try:
+                    m.add_cookie_finish(r)
+                except Exception:
+                    pass
+                wv.load_uri("https://store.epicgames.com/en-US/cart")
+                GLib.timeout_add(400, poll_cookies)
+
+            cm.add_cookie(ck, None, on_added, None)
+        else:
+            wv.load_uri(target_url)
+
+    cm.get_cookies("https://store.epicgames.com/", None, on_existing_cookies, None)
+    return False
+
+GLib.idle_add(start_flow)
 Gtk.main()
 """
     subprocess.Popen(
@@ -973,6 +1014,7 @@ class EpicRPCHandler(http.server.BaseHTTPRequestHandler):
 
 def run_daemon():
     ensure_steamui_injected()
+    _prewarm_claim_session_async()
 
     def watcher():
         while True:
