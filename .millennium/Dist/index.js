@@ -720,35 +720,9 @@ async function injectEpicDownloadsSection(doc) {
 }
 
 async function updateEpicGameDetailsStatus(doc) {
-    const candidates = Array.from(doc.querySelectorAll("button, [role='button'], div"));
-    let playBtn = null;
-    let bestArea = Infinity;
-    for (const el of candidates) {
-        if (el.closest(".se-top-btn, .se-dl-section, .se-popup-root")) continue;
-        const txt = (el.textContent || "").trim().toLowerCase();
-        if (
-            txt === "play" ||
-            txt === "hrát" ||
-            txt === "nainstalovat (epic)" ||
-            txt.startsWith("stahuje se")
-        ) {
-            const rect = el.getBoundingClientRect();
-            if (
-                rect.width >= 80 &&
-                rect.width <= 320 &&
-                rect.height >= 30 &&
-                rect.height <= 64 &&
-                rect.left > 200 &&
-                rect.top > 80
-            ) {
-                const area = rect.width * rect.height;
-                if (area < bestArea) {
-                    bestArea = area;
-                    playBtn = el;
-                }
-            }
-        }
-    }
+    const container = doc.querySelector('[class*="PlayButtonContainer"]');
+    const playBtn = container?.querySelector('[class*="PlayButton"]') || container;
+    const btnTextEl = container?.querySelector('[class*="ButtonText"]') || playBtn;
 
     let displayName = "";
     const href = doc.location?.href || doc.URL || "";
@@ -761,8 +735,7 @@ async function updateEpicGameDetailsStatus(doc) {
         displayName = ov?.display_name || "";
     }
 
-    if (!displayName && playBtn) {
-        // Fallback: find the large game title rendered in the Game Details header
+    if (!displayName && container) {
         const headings = Array.from(doc.querySelectorAll("div, span, h1, h2"));
         for (const h of headings) {
             if (h.children.length > 0) continue;
@@ -781,9 +754,14 @@ async function updateEpicGameDetailsStatus(doc) {
 
     if (!displayName.endsWith(" (Epic)")) {
         doc.querySelectorAll(".se-epic-status-pill").forEach((el) => el.remove());
+        if (container?.dataset.seEpicInstallBtn === "1") {
+            container.classList.remove("se-epic-install-btn");
+            playBtn?.classList.remove("se-epic-install-btn");
+            delete container.dataset.seEpicInstallBtn;
+        }
         return;
     }
-    if (!playBtn) return;
+    if (!container || !playBtn) return;
 
     const now = Date.now();
     if (!cachedUpdatesData || now - lastDownloadsCheckTs > 4000) {
@@ -801,37 +779,28 @@ async function updateEpicGameDetailsStatus(doc) {
         (t) => (t.title === baseTitle || `${t.title} (Epic)` === displayName) && t.status === "downloading"
     );
 
-    const findTextNode = (root) => {
-        const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-        let node;
-        while ((node = walker.nextNode())) {
-            if (node.nodeValue && node.nodeValue.trim().length > 0) return node;
-        }
-        return null;
-    };
-
-    const txtNode = findTextNode(playBtn);
     let pill = doc.querySelector(".se-epic-status-pill");
 
     if (!installed || activeTransfer) {
         const targetLabel = activeTransfer
             ? `Stahuje se… ${Math.round(activeTransfer.progress || 0)}%`
             : "Nainstalovat (Epic)";
-        if (txtNode) {
-            if (!playBtn.dataset.seOrigText) {
-                playBtn.dataset.seOrigText = txtNode.nodeValue;
+        if (btnTextEl) {
+            if (!container.dataset.seOrigText) {
+                container.dataset.seOrigText = btnTextEl.textContent || "Play";
             }
-            if (txtNode.nodeValue.trim() !== targetLabel) {
-                txtNode.nodeValue = targetLabel;
+            if (btnTextEl.textContent.trim() !== targetLabel) {
+                btnTextEl.textContent = targetLabel;
             }
         }
+        container.classList.add("se-epic-install-btn");
         playBtn.classList.add("se-epic-install-btn");
-        playBtn.dataset.seEpicInstallBtn = "1";
+        container.dataset.seEpicInstallBtn = "1";
 
-        if (!pill && playBtn.parentElement) {
+        if (!pill && container.parentElement) {
             pill = doc.createElement("span");
             pill.className = "se-epic-status-pill";
-            playBtn.parentElement.insertAdjacentElement("afterend", pill);
+            container.parentElement.insertAdjacentElement("afterend", pill);
         }
         if (pill) {
             pill.textContent = activeTransfer
@@ -839,12 +808,13 @@ async function updateEpicGameDetailsStatus(doc) {
                 : "Epic • Nenainstalováno";
         }
     } else {
-        if (playBtn.dataset.seEpicInstallBtn === "1") {
-            if (txtNode && playBtn.dataset.seOrigText) {
-                txtNode.nodeValue = playBtn.dataset.seOrigText;
+        if (container.dataset.seEpicInstallBtn === "1") {
+            if (btnTextEl && container.dataset.seOrigText) {
+                btnTextEl.textContent = container.dataset.seOrigText;
             }
+            container.classList.remove("se-epic-install-btn");
             playBtn.classList.remove("se-epic-install-btn");
-            delete playBtn.dataset.seEpicInstallBtn;
+            delete container.dataset.seEpicInstallBtn;
         }
         if (pill) {
             pill.textContent = "Epic • Nainstalováno";
@@ -1153,9 +1123,13 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_LOADED) return;
-    window.__SE_EPIC_LOADED = true;
-    setInterval(() => {
+    if (window.__SE_EPIC_VERSION === 2) return;
+    window.__SE_EPIC_VERSION = 2;
+    if (window.__SE_EPIC_TIMER) {
+        clearInterval(window.__SE_EPIC_TIMER);
+    }
+
+    const tick = () => {
         try {
             healBlankSteamBrowser();
             if (typeof g_PopupManager !== "undefined" && g_PopupManager.GetPopups) {
@@ -1167,7 +1141,17 @@ function initPlugin() {
                 });
             }
         } catch (_) {}
-    }, 1200);
+    };
+
+    try {
+        window.MainWindowBrowserManager?.m_history?.listen?.(() => {
+            setTimeout(tick, 40);
+            setTimeout(tick, 180);
+        });
+    } catch (_) {}
+
+    tick();
+    window.__SE_EPIC_TIMER = setInterval(tick, 350);
 }
 
 initPlugin();

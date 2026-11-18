@@ -1053,7 +1053,8 @@ def _ensure_cdp_injected() -> bool:
     try:
         with open(FRONTEND_SRC, "r", encoding="utf-8") as f:
             js_code = f.read()
-        if _cdp_eval(target["webSocketDebuggerUrl"], js_code):
+        wrapped = "(() => {\n" + js_code + "\n})();"
+        if _cdp_eval(target["webSocketDebuggerUrl"], wrapped):
             _CDP_INJECTED_KEY = key
             return True
     except Exception:
