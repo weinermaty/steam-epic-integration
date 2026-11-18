@@ -832,11 +832,7 @@ function syncAppStoreEpicStates() {
         const pcd = ov.per_client_data?.[0];
         if (!pcd) continue;
 
-        const targetStatus = trItem ? 3 : 11;
-        const targetPct = trItem ? Math.round(trItem.progress || 0) : isInst ? 100 : 0;
         if (pcd.installed !== isInst) pcd.installed = isInst;
-        if (pcd.display_status !== targetStatus) pcd.display_status = targetStatus;
-        if (pcd.status_percentage !== targetPct) pcd.status_percentage = targetPct;
     }
 }
 
@@ -914,22 +910,21 @@ function syncSidebarEpicRows(doc) {
 function updateEpicGameDetailsStatus(doc) {
     if (!doc || doc.title !== "Steam" || !doc.body) return;
 
-    if (!doc.body.dataset.seObsAttached) {
-        doc.body.dataset.seObsAttached = "1";
+    if (!doc.body.dataset.seScrollAttached) {
+        doc.body.dataset.seScrollAttached = "1";
         try {
-            let seMutating = false;
-            const obs = new MutationObserver(() => {
-                if (seMutating) return;
-                seMutating = true;
-                try {
-                    updateEpicGameDetailsStatus(doc);
-                } finally {
-                    obs.takeRecords();
-                    seMutating = false;
-                }
-            });
-            obs.observe(doc.body, { childList: true, subtree: true, characterData: true });
-            doc.addEventListener("scroll", () => syncSidebarEpicRows(doc), { capture: true, passive: true });
+            let scrollRaf = 0;
+            doc.addEventListener(
+                "scroll",
+                () => {
+                    if (scrollRaf) return;
+                    scrollRaf = (doc.defaultView || window).requestAnimationFrame(() => {
+                        scrollRaf = 0;
+                        syncSidebarEpicRows(doc);
+                    });
+                },
+                { capture: true, passive: true }
+            );
         } catch (_) {}
     }
 
@@ -1334,17 +1329,11 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 15) return;
-    window.__SE_EPIC_VERSION = 15;
+    if (window.__SE_EPIC_VERSION === 16) return;
+    window.__SE_EPIC_VERSION = 16;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
-    try {
-        Array.from(g_PopupManager?.GetPopups?.() || []).forEach((p) => {
-            const d = (p?.m_wnd || p?.window)?.document;
-            if (d?.body?.dataset?.seObsAttached) delete d.body.dataset.seObsAttached;
-        });
-    } catch (_) {}
 
     refreshUpdatesCacheAsync(null);
 
@@ -1365,12 +1354,13 @@ function initPlugin() {
     try {
         window.MainWindowBrowserManager?.m_history?.listen?.(() => {
             tick();
-            Promise.resolve().then(tick);
+            if (typeof requestAnimationFrame === "function") requestAnimationFrame(tick);
+            setTimeout(tick, 40);
         });
     } catch (_) {}
 
     tick();
-    window.__SE_EPIC_TIMER = setInterval(tick, 350);
+    window.__SE_EPIC_TIMER = setInterval(tick, 500);
 }
 
 initPlugin();
