@@ -135,6 +135,31 @@ const STEAM_BUTTON_CSS = `
     background: #1a9fff;
     transition: width 0.3s ease;
 }
+.se-epic-install-btn {
+    background: linear-gradient(90deg, #1a9fff 0%, #0066cc 100%) !important;
+    box-shadow: 0 2px 8px rgba(26, 159, 255, 0.35) !important;
+}
+.se-epic-install-btn:hover {
+    background: linear-gradient(90deg, #33adff 0%, #0077ee 100%) !important;
+}
+.se-epic-status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 12px;
+    padding: 4px 10px;
+    border-radius: 3px;
+    background: rgba(23, 29, 37, 0.85);
+    border: 1px solid rgba(102, 192, 244, 0.35);
+    color: #9ac6e8;
+    font-family: "Motiva Sans", Arial, Helvetica, sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    vertical-align: middle;
+    pointer-events: none;
+}
 `;
 
 const STEAM_POPUP_CSS = `
@@ -694,6 +719,109 @@ async function injectEpicDownloadsSection(doc) {
     }
 }
 
+async function updateEpicGameDetailsStatus(doc) {
+    const href = doc.location?.href || doc.URL || "";
+    const m = href.match(/\/library\/app\/(\d+)/);
+    if (!m) {
+        doc.querySelectorAll(".se-epic-status-pill").forEach((el) => el.remove());
+        return;
+    }
+
+    const appid = Number(m[1]);
+    const ov = window.appStore?.GetAppOverviewByAppID?.(appid);
+    const displayName = ov?.display_name || "";
+    if (!displayName.endsWith(" (Epic)")) {
+        doc.querySelectorAll(".se-epic-status-pill").forEach((el) => el.remove());
+        return;
+    }
+
+    const now = Date.now();
+    if (!cachedUpdatesData || now - lastDownloadsCheckTs > 4000) {
+        lastDownloadsCheckTs = now;
+        try {
+            cachedUpdatesData = await callBackend("GetEpicUpdates", { checkRemote: false });
+        } catch (_) {}
+    }
+
+    const baseTitle = displayName.slice(0, -7);
+    const installed = (cachedUpdatesData?.installedGames || []).some(
+        (g) => g.title === baseTitle || `${g.title} (Epic)` === displayName
+    );
+    const activeTransfer = (cachedUpdatesData?.activeTransfers || []).find(
+        (t) => (t.title === baseTitle || `${t.title} (Epic)` === displayName) && t.status === "downloading"
+    );
+
+    const candidates = Array.from(doc.querySelectorAll("button, [role='button'], div[class*='PlayButton']"));
+    let playBtn = null;
+    for (const el of candidates) {
+        if (el.closest(".se-top-btn, .se-dl-section, .se-popup-root")) continue;
+        const txt = (el.textContent || "").trim().toLowerCase();
+        if (
+            txt === "play" ||
+            txt === "hrát" ||
+            txt === "nainstalovat (epic)" ||
+            txt.startsWith("stahuje se")
+        ) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width >= 60 && rect.height >= 24) {
+                playBtn = el;
+                break;
+            }
+        }
+    }
+    if (!playBtn) return;
+
+    const findTextNode = (root) => {
+        const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+        let node;
+        while ((node = walker.nextNode())) {
+            if (node.nodeValue && node.nodeValue.trim().length > 0) return node;
+        }
+        return null;
+    };
+
+    const txtNode = findTextNode(playBtn);
+    let pill = doc.querySelector(".se-epic-status-pill");
+
+    if (!installed || activeTransfer) {
+        const targetLabel = activeTransfer
+            ? `Stahuje se… ${Math.round(activeTransfer.progress || 0)}%`
+            : "Nainstalovat (Epic)";
+        if (txtNode) {
+            if (!playBtn.dataset.seOrigText) {
+                playBtn.dataset.seOrigText = txtNode.nodeValue;
+            }
+            if (txtNode.nodeValue.trim() !== targetLabel) {
+                txtNode.nodeValue = targetLabel;
+            }
+        }
+        playBtn.classList.add("se-epic-install-btn");
+        playBtn.dataset.seEpicInstallBtn = "1";
+
+        if (!pill && playBtn.parentElement) {
+            pill = doc.createElement("span");
+            pill.className = "se-epic-status-pill";
+            playBtn.parentElement.insertAdjacentElement("afterend", pill);
+        }
+        if (pill) {
+            pill.textContent = activeTransfer
+                ? `Epic • Stahování (${Math.round(activeTransfer.progress || 0)}%)`
+                : "Epic • Nenainstalováno";
+        }
+    } else {
+        if (playBtn.dataset.seEpicInstallBtn === "1") {
+            if (txtNode && playBtn.dataset.seOrigText) {
+                txtNode.nodeValue = playBtn.dataset.seOrigText;
+            }
+            playBtn.classList.remove("se-epic-install-btn");
+            delete playBtn.dataset.seEpicInstallBtn;
+        }
+        if (pill) {
+            pill.textContent = "Epic • Nainstalováno";
+        }
+    }
+}
+
 function createEpicPopupComponent(React, MenuContainer, getCloseFn) {
     return function EpicMenuPopup() {
         const [snap, setSnap] = React.useState(preloadedState);
@@ -869,6 +997,7 @@ function injectIntoWindow(win) {
     if (!doc || !doc.body) return;
 
     injectEpicDownloadsSection(doc);
+    updateEpicGameDetailsStatus(doc);
 
     const existing = doc.querySelector(".se-top-btn");
     if (existing) {
