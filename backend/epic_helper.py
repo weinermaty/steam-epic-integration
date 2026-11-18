@@ -362,6 +362,9 @@ def ensure_steamui_injected() -> bool:
     return False
 
 
+LAST_DEBUG_REPORT = {}
+
+
 def dispatch_method(method: str, arg: str = "") -> dict:
     if method in ("free", "GetFreeGames"):
         return get_free_games()
@@ -375,6 +378,8 @@ def dispatch_method(method: str, arg: str = "") -> dict:
         return launch_or_install_game(arg)
     if method in ("auth", "AuthenticateEpic"):
         return start_auth(arg)
+    if method == "debug_get":
+        return LAST_DEBUG_REPORT
     return {"ok": False, "error": f"Unknown method: {method}"}
 
 
@@ -412,6 +417,11 @@ class EpicRPCHandler(http.server.BaseHTTPRequestHandler):
             body = {}
         method = body.get("method") or self.path.lstrip("/")
         args = body.get("args") or {}
+        if method == "debug_set":
+            global LAST_DEBUG_REPORT
+            LAST_DEBUG_REPORT = args if isinstance(args, dict) else {"raw": args}
+            self._send_json({"ok": True})
+            return
         arg = ""
         if isinstance(args, dict):
             arg = args.get("app_name") or args.get("auth_code") or ""

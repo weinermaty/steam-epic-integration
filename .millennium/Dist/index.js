@@ -1,11 +1,9 @@
 /**
  * Steam Epic Integration — Frontend
- * Subtle, native-Steam-styled integration:
- * 1. Placed cleanly to the left of the blue megaphone button (never overlaps the user's nickname).
- * 2. 1-click Epic Games login window (automatically detects completion, no manual code copying).
- * 3. Instant toggle switch ("Zobrazit Epic hry ve Steam Knihovně") that adds/removes all Epic games
- *    live in Steam's sidebar via SteamClient.Apps.AddShortcut / RemoveShortcut without restarting Steam.
- * 4. Free games claimer with embedded checkout popup.
+ * Uses Steam's native ContextMenuManager (bForcePopup: true) so the Epic dropdown
+ * opens in a genuine OS/CEF popup window — identical to Steam's Account and Notifications
+ * menus. It is never overlapped by the Store/Community BrowserView, automatically
+ * repositions, closes on outside click/blur/Escape, and integrates cleanly into TitleBarControls.
  */
 
 const PLUGIN_NAME = "steam-epic-integration";
@@ -34,13 +32,14 @@ async function callBackend(method, args = {}) {
     return await resp.json();
 }
 
-const STEAM_NATIVE_CSS = `
+const STEAM_BUTTON_CSS = `
 .se-top-btn {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     height: 24px;
     padding: 0 10px;
+    margin-right: 6px;
     background: #23262e;
     border: 1px solid #323844;
     color: #dcdedf;
@@ -53,6 +52,7 @@ const STEAM_NATIVE_CSS = `
     transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
     -webkit-app-region: no-drag;
     box-sizing: border-box;
+    position: relative;
 }
 .se-top-btn:hover, .se-top-btn.se-active {
     background: #3d4450;
@@ -70,21 +70,20 @@ const STEAM_NATIVE_CSS = `
 .se-badge-dot.se-visible {
     display: inline-block;
 }
-.se-popover {
-    position: fixed;
-    width: 350px;
-    max-height: 500px;
+`;
+
+const STEAM_POPUP_CSS = `
+.se-popup-root {
+    width: 340px;
     background: #171d25;
     border: 1px solid #2a313c;
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.85);
     color: #dcdedf;
     font-family: "Motiva Sans", Arial, Helvetica, sans-serif;
     font-size: 12px;
-    z-index: 99999;
     display: flex;
     flex-direction: column;
-    border-radius: 3px;
-    overflow: hidden;
+    box-sizing: border-box;
+    user-select: none;
 }
 .se-header-panel {
     background: #10151b;
@@ -98,6 +97,7 @@ const STEAM_NATIVE_CSS = `
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 8px;
 }
 .se-toggle-row {
     display: flex;
@@ -107,6 +107,7 @@ const STEAM_NATIVE_CSS = `
     padding: 7px 10px;
     border-radius: 2px;
     border: 1px solid #262f3d;
+    gap: 8px;
 }
 .se-switch {
     position: relative;
@@ -137,6 +138,7 @@ const STEAM_NATIVE_CSS = `
 }
 .se-body {
     padding: 10px 12px;
+    max-height: 370px;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
@@ -148,7 +150,6 @@ const STEAM_NATIVE_CSS = `
     letter-spacing: 0.7px;
     color: #66c0f4;
     font-weight: 600;
-    margin-top: 2px;
 }
 .se-card {
     background: #23262e;
@@ -158,7 +159,7 @@ const STEAM_NATIVE_CSS = `
 }
 .se-card img {
     width: 100%;
-    height: 120px;
+    height: 118px;
     object-fit: cover;
     display: block;
     background: #0e1217;
@@ -209,8 +210,40 @@ const STEAM_NATIVE_CSS = `
 }
 `;
 
+let steamWebpackRequire = null;
+function getWebpackRequire() {
+    if (steamWebpackRequire) return steamWebpackRequire;
+    if (window.webpackChunksteamui) {
+        window.webpackChunksteamui.push([
+            [Symbol("se_epic")],
+            {},
+            (r) => {
+                steamWebpackRequire = r;
+            },
+        ]);
+    }
+    return steamWebpackRequire;
+}
+
+function getSteamPopupModules() {
+    const req = getWebpackRequire();
+    if (!req) return null;
+    try {
+        const React = req(63696);
+        const ContextMenuMod = req(377);
+        const MenuComponents = req(12711);
+        if (React && ContextMenuMod?.lX && MenuComponents?.tz) {
+            return {
+                React,
+                showContextMenu: ContextMenuMod.lX,
+                MenuContainer: MenuComponents.tz,
+            };
+        }
+    } catch (_) {}
+    return null;
+}
+
 function openClaimPopup(url) {
-    // Open an in-Steam popup window where user stays logged in and can click "Get" + solve captcha
     const w = 1020;
     const h = 740;
     const left = Math.max(0, Math.round((window.screen.width - w) / 2));
@@ -232,7 +265,7 @@ function getStoredEpicAppIds() {
     }
 }
 
-function findExistingEpicShortcuts(helperPath) {
+function findExistingEpicShortcuts() {
     const ids = new Set(getStoredEpicAppIds());
     try {
         const apps = window.appStore?.allApps || [];
@@ -252,14 +285,14 @@ function findExistingEpicShortcuts(helperPath) {
     return Array.from(ids);
 }
 
-async function applyEpicShortcutsToSteam(enable, statusLabelEl) {
+async function applyEpicShortcutsToSteam(enable, onProgressText) {
     if (!window.SteamClient?.Apps?.AddShortcut || !window.SteamClient?.Apps?.RemoveShortcut) {
         await callBackend("SyncSteamShortcuts");
         return;
     }
 
     if (!enable) {
-        if (statusLabelEl) statusLabelEl.textContent = "Odebírám Epic hry ze Steamu…";
+        if (onProgressText) onProgressText("Odebírám Epic hry ze Steamu…");
         const toRemove = findExistingEpicShortcuts();
         for (const appid of toRemove) {
             try {
@@ -268,19 +301,18 @@ async function applyEpicShortcutsToSteam(enable, statusLabelEl) {
         }
         localStorage.setItem(STORAGE_KEY_APPIDS, "[]");
         localStorage.setItem(STORAGE_KEY_SYNC, "0");
-        if (statusLabelEl) statusLabelEl.textContent = "Zobrazit Epic hry ve Steam Knihovně";
+        if (onProgressText) onProgressText("Zobrazit Epic hry ve Steam Knihovně");
         return;
     }
 
-    if (statusLabelEl) statusLabelEl.textContent = "Načítám hry z tvého Epicu…";
+    if (onProgressText) onProgressText("Načítám hry z tvého Epicu…");
     const lib = await callBackend("GetEpicLibrary");
     if (!lib.authenticated) {
-        if (statusLabelEl) statusLabelEl.textContent = "Nejprve se přihlas k Epicu výše";
+        if (onProgressText) onProgressText("Nejprve se přihlas k Epicu výše");
         return;
     }
 
-    // Remove previous Epic shortcuts first to avoid duplicates
-    const oldIds = findExistingEpicShortcuts(lib.helperPath);
+    const oldIds = findExistingEpicShortcuts();
     for (const appid of oldIds) {
         try {
             window.SteamClient.Apps.RemoveShortcut(appid);
@@ -314,42 +346,187 @@ async function applyEpicShortcutsToSteam(enable, statusLabelEl) {
 
     localStorage.setItem(STORAGE_KEY_APPIDS, JSON.stringify(createdIds));
     localStorage.setItem(STORAGE_KEY_SYNC, "1");
-    if (statusLabelEl) {
-        statusLabelEl.textContent = `Epic hry v Knihovně (${createdIds.length} her)`;
+    if (onProgressText) {
+        onProgressText(`Epic hry v Knihovně (${createdIds.length} her)`);
     }
 }
 
+function createEpicPopupComponent(React, MenuContainer, initialFreeGames, onFreeDetected, closeMenuFn) {
+    return function EpicMenuPopup() {
+        const [loading, setLoading] = React.useState(true);
+        const [auth, setAuth] = React.useState({ authenticated: false, displayName: null });
+        const [freeGames, setFreeGames] = React.useState(initialFreeGames || []);
+        const [syncOn, setSyncOn] = React.useState(localStorage.getItem(STORAGE_KEY_SYNC) === "1");
+        const [syncText, setSyncText] = React.useState(() => {
+            const isOn = localStorage.getItem(STORAGE_KEY_SYNC) === "1";
+            return isOn
+                ? `Epic hry v Knihovně (${getStoredEpicAppIds().length} her)`
+                : "Zobrazit Epic hry ve Steam Knihovně";
+        });
+        const [loggingIn, setLoggingIn] = React.useState(false);
+
+        React.useEffect(() => {
+            let mounted = true;
+            Promise.all([
+                callBackend("GetAuthStatus"),
+                initialFreeGames ? Promise.resolve({ ok: true, games: initialFreeGames }) : callBackend("GetFreeGames"),
+            ])
+                .then(([authRes, freeRes]) => {
+                    if (!mounted) return;
+                    setAuth(authRes || { authenticated: false });
+                    if (freeRes?.games) {
+                        setFreeGames(freeRes.games);
+                        if (freeRes.games.length > 0 && onFreeDetected) onFreeDetected();
+                    }
+                    setLoading(false);
+                })
+                .catch(() => {
+                    if (mounted) setLoading(false);
+                });
+            return () => {
+                mounted = false;
+            };
+        }, []);
+
+        React.useEffect(() => {
+            if (!loggingIn) return;
+            const timer = setInterval(async () => {
+                try {
+                    const st = await callBackend("GetAuthStatus");
+                    if (st?.authenticated) {
+                        clearInterval(timer);
+                        setLoggingIn(false);
+                        setAuth(st);
+                        setSyncOn(true);
+                        await applyEpicShortcutsToSteam(true, setSyncText);
+                    }
+                } catch (_) {}
+            }, 2000);
+            return () => clearInterval(timer);
+        }, [loggingIn]);
+
+        const handleLogin = async () => {
+            setLoggingIn(true);
+            await callBackend("AuthenticateEpic", { auth_code: "" });
+        };
+
+        const handleLogout = async () => {
+            setSyncOn(false);
+            await applyEpicShortcutsToSteam(false, setSyncText);
+            await callBackend("AuthenticateEpic", { auth_code: "logout" });
+            setAuth({ authenticated: false, displayName: null });
+        };
+
+        const handleToggleSync = async () => {
+            const next = !syncOn;
+            setSyncOn(next);
+            await applyEpicShortcutsToSteam(next, setSyncText);
+        };
+
+        return React.createElement(
+            MenuContainer,
+            { bForceDesktopPresentation: true, style: { padding: 0, background: "#171d25" } },
+            React.createElement("style", null, STEAM_POPUP_CSS),
+            React.createElement(
+                "div",
+                { className: "se-popup-root" },
+                React.createElement(
+                    "div",
+                    { className: "se-header-panel" },
+                    !auth.authenticated
+                        ? React.createElement(
+                              "div",
+                              { className: "se-account-row" },
+                              React.createElement(
+                                  "span",
+                                  { className: "se-muted" },
+                                  loggingIn ? "Dokonči přihlášení v okně…" : "Epic účet není připojen"
+                              ),
+                              React.createElement(
+                                  "button",
+                                  { className: "se-btn se-btn-primary", onClick: handleLogin },
+                                  loggingIn ? "Čekám na login…" : "Přihlásit se k Epicu"
+                              )
+                          )
+                        : React.createElement(
+                              React.Fragment,
+                              null,
+                              React.createElement(
+                                  "div",
+                                  { className: "se-account-row" },
+                                  React.createElement(
+                                      "span",
+                                      { style: { color: "#ffffff", fontWeight: 500 } },
+                                      `Epic: ${auth.displayName}`
+                                  ),
+                                  React.createElement(
+                                      "button",
+                                      { className: "se-btn", onClick: handleLogout },
+                                      "Odhlásit"
+                                  )
+                              ),
+                              React.createElement(
+                                  "div",
+                                  { className: "se-toggle-row" },
+                                  React.createElement("span", { style: { color: "#dcdedf" } }, syncText),
+                                  React.createElement("div", {
+                                      className: `se-switch ${syncOn ? "se-on" : ""}`,
+                                      onClick: handleToggleSync,
+                                  })
+                              )
+                          )
+                ),
+                React.createElement(
+                    "div",
+                    { className: "se-body" },
+                    React.createElement("div", { className: "se-section-title" }, "Právě zdarma na Epicu"),
+                    loading
+                        ? React.createElement("div", { className: "se-muted" }, "Načítání…")
+                        : freeGames.length === 0
+                        ? React.createElement("div", { className: "se-muted" }, "Momentálně nejsou žádné free hry.")
+                        : freeGames.map((g) =>
+                              React.createElement(
+                                  "div",
+                                  { key: g.id || g.title, className: "se-card" },
+                                  g.image
+                                      ? React.createElement("img", { src: g.image, alt: g.title })
+                                      : null,
+                                  React.createElement(
+                                      "div",
+                                      { className: "se-card-info" },
+                                      React.createElement("div", { className: "se-card-title" }, g.title),
+                                      React.createElement(
+                                          "button",
+                                          {
+                                              className: "se-btn se-btn-primary",
+                                              onClick: () => {
+                                                  if (closeMenuFn) closeMenuFn();
+                                                  openClaimPopup(g.storeUrl);
+                                              },
+                                          },
+                                          "Vyzvednout zdarma"
+                                      )
+                                  )
+                              )
+                          )
+                )
+            )
+        );
+    };
+}
+
 function placeButtonInSteamTopBar(doc, btn) {
-    // 1. Best: insert as the first flex item inside Steam's TitleBarControls container
-    //    so flexbox automatically pushes the megaphone, bell, and nickname without overlapping!
     const titleBarControls =
         doc.querySelector("._1-9sir4j_KQiMqdkZjQN0u") ||
+        doc.querySelector("._3cykd-VfN_xBxf3Qxriccm") ||
         doc.querySelector('[class*="TitleBarControls"]');
     if (titleBarControls) {
-        btn.style.position = "relative";
-        btn.style.top = "0";
-        btn.style.right = "auto";
-        btn.style.marginRight = "6px";
         if (btn.parentElement !== titleBarControls) {
             titleBarControls.insertBefore(btn, titleBarControls.firstChild);
         }
-        return;
+        return true;
     }
-
-    // 2. Fallback: insert right after "Help" in RootMenuBar (Steam | View | Friends | Games | Help | • Epic)
-    const rootMenu =
-        doc.querySelector("._3s0lkohH8wU2do0K1il28Y") ||
-        doc.querySelector('[class*="RootMenuBar"]');
-    if (rootMenu) {
-        btn.style.position = "relative";
-        btn.style.top = "0";
-        btn.style.right = "auto";
-        btn.style.marginLeft = "8px";
-        if (btn.parentElement !== rootMenu) {
-            rootMenu.appendChild(btn);
-        }
-        return;
-    }
+    return false;
 }
 
 function injectIntoWindow(win) {
@@ -365,7 +542,7 @@ function injectIntoWindow(win) {
     if (!doc.getElementById("se-steam-styles")) {
         const style = doc.createElement("style");
         style.id = "se-steam-styles";
-        style.textContent = STEAM_NATIVE_CSS;
+        style.textContent = STEAM_BUTTON_CSS;
         doc.head.appendChild(style);
     }
 
@@ -379,167 +556,80 @@ function injectIntoWindow(win) {
     btn.appendChild(dot);
     btn.appendChild(label);
 
-    let popover = null;
-    let cachedFree = null;
-    let loginPollTimer = null;
-
-    async function renderPopover(popEl) {
-        popEl.innerHTML = '<div class="se-body"><div class="se-muted">Načítání…</div></div>';
-        try {
-            const [authRes, freeRes] = await Promise.all([
-                callBackend("GetAuthStatus"),
-                cachedFree ? Promise.resolve(cachedFree) : callBackend("GetFreeGames"),
-            ]);
-            cachedFree = freeRes;
-            popEl.innerHTML = "";
-
-            // 1. Header panel: Login state + 1-click Library Sync Toggle
-            const header = doc.createElement("div");
-            header.className = "se-header-panel";
-
-            const accRow = doc.createElement("div");
-            accRow.className = "se-account-row";
-
-            if (!authRes.authenticated) {
-                const info = doc.createElement("span");
-                info.className = "se-muted";
-                info.textContent = "Epic účet není připojen";
-                const loginBtn = doc.createElement("button");
-                loginBtn.className = "se-btn se-btn-primary";
-                loginBtn.textContent = "Přihlásit se k Epicu";
-                loginBtn.onclick = async () => {
-                    loginBtn.textContent = "Otevírám přihlášení…";
-                    await callBackend("AuthenticateEpic", { auth_code: "" });
-                    if (loginPollTimer) clearInterval(loginPollTimer);
-                    loginPollTimer = setInterval(async () => {
-                        const st = await callBackend("GetAuthStatus");
-                        if (st.authenticated) {
-                            clearInterval(loginPollTimer);
-                            loginPollTimer = null;
-                            // Auto-enable library sync right after first login!
-                            await applyEpicShortcutsToSteam(true, null);
-                            if (popover) renderPopover(popover);
-                        }
-                    }, 2000);
-                };
-                accRow.append(info, loginBtn);
-                header.appendChild(accRow);
-            } else {
-                const info = doc.createElement("span");
-                info.style.cssText = "color:#ffffff;font-weight:500;";
-                info.textContent = `Epic: ${authRes.displayName}`;
-                const logoutBtn = doc.createElement("button");
-                logoutBtn.className = "se-btn";
-                logoutBtn.textContent = "Odhlásit";
-                logoutBtn.onclick = async () => {
-                    await applyEpicShortcutsToSteam(false, null);
-                    await callBackend("AuthenticateEpic", { auth_code: "logout" });
-                    if (popover) renderPopover(popover);
-                };
-                accRow.append(info, logoutBtn);
-
-                // Toggle switch: Show Epic games in Steam Library
-                const toggleRow = doc.createElement("div");
-                toggleRow.className = "se-toggle-row";
-                const isSyncOn = localStorage.getItem(STORAGE_KEY_SYNC) === "1";
-                const toggleLabel = doc.createElement("span");
-                toggleLabel.style.color = "#dcdedf";
-                const count = getStoredEpicAppIds().length;
-                toggleLabel.textContent = isSyncOn
-                    ? `Epic hry v Knihovně (${count} her)`
-                    : "Zobrazit Epic hry ve Steam Knihovně";
-
-                const sw = doc.createElement("div");
-                sw.className = `se-switch ${isSyncOn ? "se-on" : ""}`;
-                sw.onclick = async () => {
-                    const nextState = !sw.classList.contains("se-on");
-                    sw.classList.toggle("se-on", nextState);
-                    await applyEpicShortcutsToSteam(nextState, toggleLabel);
-                };
-
-                toggleRow.append(toggleLabel, sw);
-                header.append(accRow, toggleRow);
-            }
-
-            popEl.appendChild(header);
-
-            // 2. Body: Free games of the week
-            const body = doc.createElement("div");
-            body.className = "se-body";
-
-            const secTitle = doc.createElement("div");
-            secTitle.className = "se-section-title";
-            secTitle.textContent = "Právě zdarma na Epicu";
-            body.appendChild(secTitle);
-
-            if (!freeRes.ok || !freeRes.games?.length) {
-                const empty = doc.createElement("div");
-                empty.className = "se-muted";
-                empty.textContent = "Momentálně nejsou žádné free hry.";
-                body.appendChild(empty);
-            } else {
-                dot.classList.add("se-visible");
-                freeRes.games.forEach((g) => {
-                    const card = doc.createElement("div");
-                    card.className = "se-card";
-                    if (g.image) {
-                        const img = doc.createElement("img");
-                        img.src = g.image;
-                        card.appendChild(img);
-                    }
-                    const info = doc.createElement("div");
-                    info.className = "se-card-info";
-                    const title = doc.createElement("div");
-                    title.className = "se-card-title";
-                    title.textContent = g.title;
-                    const claimBtn = doc.createElement("button");
-                    claimBtn.className = "se-btn se-btn-primary";
-                    claimBtn.textContent = "Vyzvednout zdarma";
-                    claimBtn.onclick = () => openClaimPopup(g.storeUrl);
-                    info.append(title, claimBtn);
-                    card.appendChild(info);
-                    body.appendChild(card);
-                });
-            }
-
-            popEl.appendChild(body);
-        } catch (err) {
-            popEl.innerHTML = `<div class="se-body"><div class="se-muted">Chyba: ${err.message || err}</div></div>`;
-        }
+    if (!placeButtonInSteamTopBar(doc, btn)) {
+        return;
     }
 
-    function togglePopover() {
-        if (popover) {
-            popover.remove();
-            popover = null;
-            btn.classList.remove("se-active");
-            if (loginPollTimer) {
-                clearInterval(loginPollTimer);
-                loginPollTimer = null;
+    let cachedFreeGames = null;
+    let activeMenuInstance = null;
+    let lastHideTimestamp = 0;
+
+    btn.addEventListener("mousedown", (ev) => {
+        ev.stopPropagation();
+    });
+
+    btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+
+        // If menu was open or just closed by blur on this mousedown, toggle off cleanly
+        if (activeMenuInstance?.visible || Date.now() - lastHideTimestamp < 220) {
+            if (activeMenuInstance?.visible) {
+                activeMenuInstance.Hide();
             }
+            activeMenuInstance = null;
+            btn.classList.remove("se-active");
             return;
         }
+
+        const mods = getSteamPopupModules();
+        if (!mods) return;
+
+        const { React, showContextMenu, MenuContainer } = mods;
+        const EpicPopup = createEpicPopupComponent(
+            React,
+            MenuContainer,
+            cachedFreeGames,
+            () => dot.classList.add("se-visible"),
+            () => {
+                if (activeMenuInstance?.visible) activeMenuInstance.Hide();
+            }
+        );
+
         btn.classList.add("se-active");
-        popover = doc.createElement("div");
-        popover.className = "se-popover";
+        activeMenuInstance = showContextMenu(React.createElement(EpicPopup, null), btn, {
+            bOverlapHorizontal: true,
+            bForcePopup: true,
+            bDisableMouseOverlay: true,
+            title: "Epic Games Integration",
+        });
 
-        const rect = btn.getBoundingClientRect();
-        popover.style.top = `${Math.max(32, rect.bottom + 6)}px`;
-        popover.style.right = `${Math.max(12, doc.documentElement.clientWidth - rect.right)}px`;
-
-        doc.body.appendChild(popover);
-        renderPopover(popover);
-    }
-
-    btn.onclick = togglePopover;
-    placeButtonInSteamTopBar(doc, btn);
+        if (activeMenuInstance?.SetOnHideCallback) {
+            activeMenuInstance.SetOnHideCallback(() => {
+                lastHideTimestamp = Date.now();
+                activeMenuInstance = null;
+                btn.classList.remove("se-active");
+            });
+        }
+    });
 
     callBackend("GetFreeGames")
         .then((res) => {
-            cachedFree = res;
-            if (res?.ok && res.games?.length > 0) {
-                dot.classList.add("se-visible");
+            if (res?.ok && Array.isArray(res.games)) {
+                cachedFreeGames = res.games;
+                if (res.games.length > 0) {
+                    dot.classList.add("se-visible");
+                }
             }
+            const mods = getSteamPopupModules();
+            const r = btn.getBoundingClientRect();
+            callBackend("debug_set", {
+                injected: true,
+                parentClass: btn.parentElement?.className || "",
+                btnRect: { left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) },
+                hasPopupModules: !!mods,
+                freeCount: cachedFreeGames?.length || 0,
+            }).catch(() => {});
         })
         .catch(() => {});
 }
@@ -556,7 +646,7 @@ function initPlugin() {
                 });
             }
         } catch (_) {}
-    }, 1500);
+    }, 1200);
 }
 
 initPlugin();
