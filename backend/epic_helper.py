@@ -484,6 +484,13 @@ def get_artwork_base64(app_name: str, tall_url: str, wide_url: str) -> dict:
     tall_data = _download_artwork_bytes(app_name, "tall", tall_url)
     wide_data = _download_artwork_bytes(app_name, "wide", wide_url)
     icon_path = _ensure_png_icon(app_name, tall_data or wide_data)
+    icon_b64 = ""
+    if icon_path and os.path.isfile(icon_path):
+        try:
+            with open(icon_path, "rb") as f:
+                icon_b64 = base64.b64encode(f.read()).decode("ascii")
+        except Exception:
+            pass
     if not tall_data and not wide_data:
         return {"ok": False}
     return {
@@ -491,6 +498,7 @@ def get_artwork_base64(app_name: str, tall_url: str, wide_url: str) -> dict:
         "tallBase64": base64.b64encode(tall_data).decode("ascii") if tall_data else "",
         "wideBase64": base64.b64encode(wide_data).decode("ascii") if wide_data else "",
         "iconPath": icon_path,
+        "iconBase64": icon_b64,
     }
 
 
