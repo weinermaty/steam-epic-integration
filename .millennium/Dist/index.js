@@ -162,6 +162,28 @@ body[data-se-epic-uninstalled="1"] [class*="PlayButton"]:hover {
 .se-epic-uninstalled-row * {
     color: rgb(163, 170, 185) !important;
 }
+.se-epic-downloading-row,
+.se-epic-downloading-row * {
+    color: #66c0f4 !important;
+}
+.se-epic-row::after {
+    content: attr(data-se-dl-pct);
+    display: inline-flex;
+    align-items: center;
+    height: 14px;
+    min-width: 14px;
+    margin-left: auto;
+    padding-left: 17px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 2.2C2.5 1.65 2.95 1.2 3.5 1.2H12.5C13.05 1.2 13.5 1.65 13.5 2.2V10.1C13.5 10.6 13.25 11.06 12.83 11.33L8.55 14.12C8.21 14.34 7.79 14.34 7.45 14.12L3.17 11.33C2.75 11.06 2.5 10.6 2.5 10.1V2.2Z' fill='%232b384c' stroke='%2366c0f4' stroke-width='1.15'/%3E%3Cpath d='M9.3 3.6L5.7 8.2H8.1L6.7 12.1L10.4 7.3H8L9.3 3.6Z' fill='%2366c0f4'/%3E%3C/svg%3E");
+    background-position: left center;
+    background-size: 13px 13px;
+    background-repeat: no-repeat;
+    font-size: 11px;
+    font-weight: 700;
+    color: #1a9fff !important;
+    opacity: 0.9;
+    flex-shrink: 0;
+}
 .se-epic-status-pill {
     display: inline-flex;
     align-items: center;
@@ -774,33 +796,103 @@ async function injectEpicDownloadsSection(doc) {
     }
 }
 
+const EPIC_PLUGIN_SVG = `<svg class="se-epic-badge-svg" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Epic"><path d="M2.5 2.2C2.5 1.65 2.95 1.2 3.5 1.2H12.5C13.05 1.2 13.5 1.65 13.5 2.2V10.1C13.5 10.6 13.25 11.06 12.83 11.33L8.55 14.12C8.21 14.34 7.79 14.34 7.45 14.12L3.17 11.33C2.75 11.06 2.5 10.6 2.5 10.1V2.2Z" fill="#2b384c" stroke="#66c0f4" stroke-width="1.15"/><path d="M9.3 3.6L5.7 8.2H8.1L6.7 12.1L10.4 7.3H8L9.3 3.6Z" fill="#66c0f4"/></svg>`;
+
+function syncAppStoreEpicStates() {
+    const apps = window.appStore?.allApps;
+    if (!apps || !cachedUpdatesData) return;
+    const installedTitles = new Set((cachedUpdatesData.installedGames || []).map((g) => g.title));
+    const activeMap = new Map(
+        (cachedUpdatesData.activeTransfers || [])
+            .filter((t) => t.status === "downloading")
+            .map((t) => [t.title, t])
+    );
+
+    for (const ov of apps) {
+        if (!ov) continue;
+        const name = ov.display_name || "";
+        if (!name.endsWith(" (Epic)")) continue;
+        const base = name.slice(0, -7);
+        const isInst = installedTitles.has(base);
+        const trItem = activeMap.get(base);
+        const pcd = ov.per_client_data?.[0];
+        if (!pcd) continue;
+
+        const targetStatus = trItem ? 3 : 11;
+        const targetPct = trItem ? Math.round(trItem.progress || 0) : isInst ? 100 : 0;
+        if (pcd.installed !== isInst) pcd.installed = isInst;
+        if (pcd.display_status !== targetStatus) pcd.display_status = targetStatus;
+        if (pcd.status_percentage !== targetPct) pcd.status_percentage = targetPct;
+    }
+}
+
 function refreshUpdatesCacheAsync(doc) {
     const now = Date.now();
-    if (now - lastDownloadsCheckTs <= 4000) return;
+    const hasActive = (cachedUpdatesData?.activeTransfers || []).some((t) => t.status === "downloading");
+    const interval = hasActive ? 1500 : 4000;
+    if (now - lastDownloadsCheckTs <= interval) return;
     lastDownloadsCheckTs = now;
     callBackend("GetEpicUpdates", { checkRemote: false })
         .then((res) => {
             if (res) {
                 cachedUpdatesData = res;
+                syncAppStoreEpicStates();
                 if (doc) updateEpicGameDetailsStatus(doc);
             }
         })
         .catch(() => {});
 }
 
+function findRowLabelTextNode(doc, row) {
+    const walker = doc.createTreeWalker(row, NodeFilter.SHOW_TEXT, null);
+    let node;
+    while ((node = walker.nextNode())) {
+        if (node.parentElement?.closest?.(".se-epic-dl-pct, .se-epic-badge-svg")) continue;
+        if (node.nodeValue && node.nodeValue.trim().length > 0) return node;
+    }
+    return null;
+}
+
 function syncSidebarEpicRows(doc) {
     if (!doc || doc.title !== "Steam") return;
-    const installedTitles = new Set(
-        (cachedUpdatesData?.installedGames || []).map((g) => g.title)
+    const installedTitles = new Set((cachedUpdatesData?.installedGames || []).map((g) => g.title));
+    const activeMap = new Map(
+        (cachedUpdatesData?.activeTransfers || [])
+            .filter((t) => t.status === "downloading")
+            .map((t) => [t.title, t])
     );
+
     const sidebarRows = doc.querySelectorAll('[class*="GameListEntryContainer"]');
     for (const row of sidebarRows) {
-        const txt = (row.textContent || "").trim();
-        if (txt.endsWith(" (Epic)")) {
-            const base = txt.slice(0, -7);
-            row.classList.toggle("se-epic-uninstalled-row", !installedTitles.has(base));
-        } else if (row.classList.contains("se-epic-uninstalled-row")) {
-            row.classList.remove("se-epic-uninstalled-row");
+        const txtNode = findRowLabelTextNode(doc, row);
+        const rawTxt = (txtNode?.nodeValue || "").trim();
+        let base = "";
+
+        if (rawTxt.endsWith(" (Epic)")) {
+            base = rawTxt.slice(0, -7);
+            row.dataset.seEpicBase = base;
+            if (txtNode) txtNode.nodeValue = base;
+        } else if (row.dataset.seEpicBase && rawTxt === row.dataset.seEpicBase) {
+            base = row.dataset.seEpicBase;
+        } else {
+            if (row.dataset.seEpicBase) delete row.dataset.seEpicBase;
+            if (row.dataset.seDlPct) delete row.dataset.seDlPct;
+            row.classList.remove("se-epic-row", "se-epic-uninstalled-row", "se-epic-downloading-row");
+            continue;
+        }
+
+        const isInst = installedTitles.has(base);
+        const trItem = activeMap.get(base);
+
+        row.classList.add("se-epic-row");
+        row.classList.toggle("se-epic-downloading-row", !!trItem);
+        row.classList.toggle("se-epic-uninstalled-row", !trItem && !isInst);
+
+        if (trItem) {
+            const pctText = `${Math.round(trItem.progress || 0)}%`;
+            if (row.dataset.seDlPct !== pctText) row.dataset.seDlPct = pctText;
+        } else if (row.dataset.seDlPct !== "") {
+            row.dataset.seDlPct = "";
         }
     }
 }
@@ -863,8 +955,6 @@ function updateEpicGameDetailsStatus(doc) {
         return;
     }
 
-    refreshUpdatesCacheAsync(doc);
-
     const baseTitle = displayName.slice(0, -7);
     const installed = (cachedUpdatesData?.installedGames || []).some(
         (g) => g.title === baseTitle || `${g.title} (Epic)` === displayName
@@ -888,10 +978,10 @@ function updateEpicGameDetailsStatus(doc) {
         if (!installed || activeTransfer) {
             const targetLabel = activeTransfer
                 ? tr(
-                      `Stahuje se… ${Math.round(activeTransfer.progress || 0)}%`,
-                      `Downloading… ${Math.round(activeTransfer.progress || 0)}%`
+                      `Stahuje se ${Math.round(activeTransfer.progress || 0)}%`,
+                      `Downloading ${Math.round(activeTransfer.progress || 0)}%`
                   )
-                : tr("Nainstalovat (Epic)", "Install (Epic)");
+                : tr("Nainstalovat", "Install");
             if (btnTextEl) {
                 if (!container.dataset.seOrigText) {
                     container.dataset.seOrigText = btnTextEl.textContent || "Play";
@@ -1230,8 +1320,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 12) return;
-    window.__SE_EPIC_VERSION = 12;
+    if (window.__SE_EPIC_VERSION === 14) return;
+    window.__SE_EPIC_VERSION = 14;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
