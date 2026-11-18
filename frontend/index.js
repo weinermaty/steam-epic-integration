@@ -1268,18 +1268,21 @@ function updateEpicGameDetailsStatus(doc) {
 
     // Replace ugly dashed Non-Steam notice box with native Steam metadata & controls strip
     let noticeBox = null;
+    let bestNoticeH = Infinity;
     for (const el of doc.querySelectorAll("div")) {
-        if (el.children.length > 2) continue;
+        if (el.classList.contains("se-game-info-strip")) continue;
         const t = el.textContent || "";
         if (t.includes("is unavailable because it is a non-Steam game") || t.includes("nejsou k dispozici, protože")) {
+            if (el.querySelector('[class*="PlayButtonContainer"]')) continue;
             const r = el.getBoundingClientRect();
-            if (r.left > 200 && r.width > 200) {
+            if (r.left > 200 && r.width > 200 && r.height > 20 && r.height < 180 && r.height < bestNoticeH) {
+                bestNoticeH = r.height;
                 noticeBox = el;
-                break;
             }
         }
     }
     if (noticeBox) {
+        noticeBox.dataset.seHiddenNotice = "1";
         noticeBox.style.display = "none";
         let strip = noticeBox.parentElement?.querySelector(".se-game-info-strip");
         const stripKey = JSON.stringify({
@@ -1293,7 +1296,7 @@ function updateEpicGameDetailsStatus(doc) {
         if (!strip) {
             strip = doc.createElement("div");
             strip.className = "se-game-info-strip";
-            noticeBox.insertAdjacentElement("afterend", strip);
+            noticeBox.parentElement.appendChild(strip);
         }
         if (strip.dataset.seStripKey !== stripKey) {
             strip.dataset.seStripKey = stripKey;
@@ -1682,11 +1685,21 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 18) return;
-    window.__SE_EPIC_VERSION = 18;
+    if (window.__SE_EPIC_VERSION === 19) return;
+    window.__SE_EPIC_VERSION = 19;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
+    try {
+        Array.from(g_PopupManager?.GetPopups?.() || []).forEach((p) => {
+            const d = (p?.m_wnd || p?.window)?.document;
+            if (d?.title === "Steam") {
+                d.querySelectorAll('div[style*="display: none"]').forEach((el) => {
+                    if (!el.dataset.seHiddenNotice) el.style.display = "";
+                });
+            }
+        });
+    } catch (_) {}
 
     refreshUpdatesCacheAsync(null);
 
