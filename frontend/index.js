@@ -20,6 +20,18 @@ const STORAGE_KEY_SEEN_FREE = "se_seen_free_ids";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function isCzechSteam() {
+    try {
+        const lang = new URLSearchParams(window.location?.search || "").get("LANGUAGE");
+        if (lang) return lang.toLowerCase() === "czech";
+        const loc = window.LocalizationManager?.GetPreferredLocales?.()?.[0];
+        if (loc) return loc.toLowerCase().startsWith("cs");
+    } catch (_) {}
+    return false;
+}
+
+const tr = (cs, en) => (isCzechSteam() ? cs : en);
+
 async function callBackend(method, args = {}) {
     if (window.Millennium && typeof window.Millennium.callServerMethod === "function") {
         try {
@@ -441,7 +453,12 @@ async function streamEpicCoverArtInBackground(gamesWithIds, onProgressText) {
                 if (doneCount % 15 === 0) {
                     localStorage.setItem(STORAGE_KEY_ART_DONE, JSON.stringify(doneSet));
                     if (onProgressText) {
-                        onProgressText(`Epic v Knihovně (${gamesWithIds.length} her • obaly ${doneCount}/${gamesWithIds.length})`);
+                        onProgressText(
+                            tr(
+                                `Epic v Knihovně (${gamesWithIds.length} her • obaly ${doneCount}/${gamesWithIds.length})`,
+                                `Epic in Library (${gamesWithIds.length} games • art ${doneCount}/${gamesWithIds.length})`
+                            )
+                        );
                     }
                 }
             }
@@ -450,7 +467,12 @@ async function streamEpicCoverArtInBackground(gamesWithIds, onProgressText) {
     }
     localStorage.setItem(STORAGE_KEY_ART_DONE, JSON.stringify(doneSet));
     if (onProgressText) {
-        onProgressText(`Epic hry v Knihovně (${gamesWithIds.length} her)`);
+        onProgressText(
+            tr(
+                `Epic hry v Knihovně (${gamesWithIds.length} her)`,
+                `Epic games in Library (${gamesWithIds.length} games)`
+            )
+        );
     }
 }
 
@@ -474,20 +496,26 @@ async function applyEpicShortcutsToSteam(enable, onProgressText, forceRefresh = 
                 } catch (_) {}
                 idx++;
                 if (idx % 15 === 0) {
-                    if (onProgressText) onProgressText(`Schovávám Epic hry (${idx}/${toRemove.length})…`);
+                    if (onProgressText) {
+                        onProgressText(
+                            tr(`Schovávám Epic hry (${idx}/${toRemove.length})…`, `Hiding Epic games (${idx}/${toRemove.length})…`)
+                        );
+                    }
                     await sleep(25);
                 }
             }
             localStorage.setItem(STORAGE_KEY_APPIDS, "[]");
             localStorage.setItem(STORAGE_KEY_SYNC, "0");
-            if (onProgressText) onProgressText("Zobrazit Epic hry ve Steam Knihovně");
+            if (onProgressText) {
+                onProgressText(tr("Zobrazit Epic hry ve Steam Knihovně", "Show Epic games in Steam Library"));
+            }
             return;
         }
 
-        if (onProgressText) onProgressText("Načítám Epic knihovnu…");
+        if (onProgressText) onProgressText(tr("Načítám Epic knihovnu…", "Loading Epic library…"));
         const lib = await callBackend("GetEpicLibrary", { forceRefresh });
         if (!lib.authenticated) {
-            if (onProgressText) onProgressText("Nejprve se přihlas k Epicu výše");
+            if (onProgressText) onProgressText(tr("Nejprve se přihlas k Epicu výše", "Sign in to Epic above first"));
             return;
         }
 
@@ -535,14 +563,21 @@ async function applyEpicShortcutsToSteam(enable, onProgressText, forceRefresh = 
 
             processed++;
             if (processed % 25 === 0 && onProgressText) {
-                onProgressText(`Synchronizuji Epic (${processed}/${allGames.length})…`);
+                onProgressText(
+                    tr(`Synchronizuji Epic (${processed}/${allGames.length})…`, `Syncing Epic (${processed}/${allGames.length})…`)
+                );
             }
         }
 
         localStorage.setItem(STORAGE_KEY_APPIDS, JSON.stringify(finalIds));
         localStorage.setItem(STORAGE_KEY_SYNC, "1");
         if (onProgressText) {
-            onProgressText(`Epic hry v Knihovně (${finalIds.length} her)`);
+            onProgressText(
+                tr(
+                    `Epic hry v Knihovně (${finalIds.length} her)`,
+                    `Epic games in Library (${finalIds.length} games)`
+                )
+            );
         }
 
         streamEpicCoverArtInBackground(artworkQueue, onProgressText);
@@ -670,38 +705,41 @@ async function injectEpicDownloadsSection(doc) {
     hdr.className = "se-dl-header";
     const title = doc.createElement("div");
     title.className = "se-dl-title";
-    title.textContent = `Epic Games Aktualizace & Stahování (${pending.length + active.length})`;
+    title.textContent = tr(
+        `Epic Games Aktualizace & Stahování (${pending.length + active.length})`,
+        `Epic Games Updates & Downloads (${pending.length + active.length})`
+    );
     const checkBtn = doc.createElement("button");
     checkBtn.className = "se-btn";
-    checkBtn.textContent = "Zkontrolovat aktualizace";
+    checkBtn.textContent = tr("Zkontrolovat aktualizace", "Check for updates");
     checkBtn.onclick = async () => {
-        checkBtn.textContent = "Kontroluji…";
+        checkBtn.textContent = tr("Kontroluji…", "Checking…");
         cachedUpdatesData = await callBackend("GetEpicUpdates", { checkRemote: true });
         injectEpicDownloadsSection(doc);
     };
     hdr.append(title, checkBtn);
     container.appendChild(hdr);
 
-    for (const tr of active) {
+    for (const trItem of active) {
         const row = doc.createElement("div");
         row.className = "se-dl-row";
         const nameEl = doc.createElement("div");
         nameEl.style.cssText = "font-weight:500;color:#fff;flex:1;";
-        nameEl.textContent = `${tr.title} (Epic)`;
+        nameEl.textContent = `${trItem.title} (Epic)`;
         const barWrap = doc.createElement("div");
         barWrap.className = "se-dl-bar-wrap";
         const bar = doc.createElement("div");
         bar.className = "se-dl-bar";
-        bar.style.width = `${Math.min(100, Math.round(tr.progress || 0))}%`;
+        bar.style.width = `${Math.min(100, Math.round(trItem.progress || 0))}%`;
         barWrap.appendChild(bar);
         const infoEl = doc.createElement("div");
         infoEl.className = "se-muted";
         infoEl.textContent =
-            tr.status === "completed"
-                ? "Dokončeno (100%)"
-                : tr.status === "failed"
-                ? "Chyba stahování"
-                : `${Math.round(tr.progress || 0)}% ${tr.speed ? "• " + tr.speed : ""} ${tr.eta ? "• ETA " + tr.eta : ""}`;
+            trItem.status === "completed"
+                ? tr("Dokončeno (100%)", "Completed (100%)")
+                : trItem.status === "failed"
+                ? tr("Chyba stahování", "Download failed")
+                : `${Math.round(trItem.progress || 0)}% ${trItem.speed ? "• " + trItem.speed : ""} ${trItem.eta ? "• ETA " + trItem.eta : ""}`;
         row.append(nameEl, barWrap, infoEl);
         container.appendChild(row);
     }
@@ -712,12 +750,15 @@ async function injectEpicDownloadsSection(doc) {
         row.className = "se-dl-row";
         const nameEl = doc.createElement("div");
         nameEl.style.cssText = "font-weight:500;color:#fff;";
-        nameEl.textContent = `${up.title} (Epic) — dostupná verze ${up.latestVersion}`;
+        nameEl.textContent = tr(
+            `${up.title} (Epic) — dostupná verze ${up.latestVersion}`,
+            `${up.title} (Epic) — update available ${up.latestVersion}`
+        );
         const updBtn = doc.createElement("button");
         updBtn.className = "se-btn se-btn-primary";
-        updBtn.textContent = "Aktualizovat";
+        updBtn.textContent = tr("Aktualizovat", "Update");
         updBtn.onclick = async () => {
-            updBtn.textContent = "Spouštím…";
+            updBtn.textContent = tr("Spouštím…", "Starting…");
             await callBackend("UpdateEpicGame", { app_name: up.appName, title: up.title });
             lastDownloadsCheckTs = 0;
             injectEpicDownloadsSection(doc);
@@ -874,8 +915,11 @@ function updateEpicGameDetailsStatus(doc) {
 
         if (!installed || activeTransfer) {
             const targetLabel = activeTransfer
-                ? `Stahuje se… ${Math.round(activeTransfer.progress || 0)}%`
-                : "Nainstalovat (Epic)";
+                ? tr(
+                      `Stahuje se… ${Math.round(activeTransfer.progress || 0)}%`,
+                      `Downloading… ${Math.round(activeTransfer.progress || 0)}%`
+                  )
+                : tr("Nainstalovat (Epic)", "Install (Epic)");
             if (btnTextEl) {
                 if (!container.dataset.seOrigText) {
                     container.dataset.seOrigText = btnTextEl.textContent || "Play";
@@ -914,8 +958,8 @@ function createEpicPopupComponent(React, MenuContainer, getCloseFn) {
             const existingCount = getExistingEpicShortcutsMap().size;
             const isOn = localStorage.getItem(STORAGE_KEY_SYNC) === "1" || existingCount > 0;
             return isOn
-                ? `Epic hry v Knihovně (${existingCount} her)`
-                : "Zobrazit Epic hry ve Steam Knihovně";
+                ? tr(`Epic hry v Knihovně (${existingCount} her)`, `Epic games in Library (${existingCount} games)`)
+                : tr("Zobrazit Epic hry ve Steam Knihovně", "Show Epic games in Steam Library");
         });
         const [loggingIn, setLoggingIn] = React.useState(false);
 
@@ -986,12 +1030,16 @@ function createEpicPopupComponent(React, MenuContainer, getCloseFn) {
                               React.createElement(
                                   "span",
                                   { className: "se-muted" },
-                                  loggingIn ? "Dokonči přihlášení v okně…" : "Epic účet není připojen"
+                                  loggingIn
+                                      ? tr("Dokonči přihlášení v okně…", "Complete sign-in in the popup…")
+                                      : tr("Epic účet není připojen", "Epic account not connected")
                               ),
                               React.createElement(
                                   "button",
                                   { className: "se-btn se-btn-primary", onClick: handleLogin },
-                                  loggingIn ? "Čekám na login…" : "Přihlásit se k Epicu"
+                                  loggingIn
+                                      ? tr("Čekám na login…", "Waiting for login…")
+                                      : tr("Přihlásit se k Epicu", "Sign in to Epic")
                               )
                           )
                         : React.createElement(
@@ -1008,7 +1056,7 @@ function createEpicPopupComponent(React, MenuContainer, getCloseFn) {
                                   React.createElement(
                                       "button",
                                       { className: "se-btn", onClick: handleLogout },
-                                      "Odhlásit"
+                                      tr("Odhlásit", "Sign out")
                                   )
                               ),
                               React.createElement(
@@ -1025,11 +1073,11 @@ function createEpicPopupComponent(React, MenuContainer, getCloseFn) {
                 React.createElement(
                     "div",
                     { className: "se-body" },
-                    React.createElement("div", { className: "se-section-title" }, "Právě zdarma na Epicu"),
+                    React.createElement("div", { className: "se-section-title" }, tr("Právě zdarma na Epicu", "Free on Epic right now")),
                     !snap.ready && freeGames.length === 0
-                        ? React.createElement("div", { className: "se-muted" }, "Načítání…")
+                        ? React.createElement("div", { className: "se-muted" }, tr("Načítání…", "Loading…"))
                         : freeGames.length === 0
-                        ? React.createElement("div", { className: "se-muted" }, "Momentálně nejsou žádné free hry.")
+                        ? React.createElement("div", { className: "se-muted" }, tr("Momentálně nejsou žádné free hry.", "No free games right now."))
                         : freeGames.map((g) =>
                               React.createElement(
                                   "div",
@@ -1051,7 +1099,7 @@ function createEpicPopupComponent(React, MenuContainer, getCloseFn) {
                                                   openClaimPopup(g.checkoutUrl || g.storeUrl);
                                               },
                                           },
-                                          "Vyzvednout zdarma"
+                                          tr("Vyzvednout zdarma", "Claim for free")
                                       )
                                   )
                               )
@@ -1101,7 +1149,7 @@ function injectIntoWindow(win) {
 
     const btn = doc.createElement("div");
     btn.className = "se-top-btn";
-    btn.title = "Epic Free Games & Knihovna";
+    btn.title = tr("Epic Free Games & Knihovna", "Epic Free Games & Library");
     const dot = doc.createElement("span");
     dot.className = "se-badge-dot";
     dot.textContent = "!";
@@ -1210,8 +1258,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 9) return;
-    window.__SE_EPIC_VERSION = 9;
+    if (window.__SE_EPIC_VERSION === 10) return;
+    window.__SE_EPIC_VERSION = 10;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
