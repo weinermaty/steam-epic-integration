@@ -741,21 +741,8 @@ function refreshUpdatesCacheAsync(doc) {
         .catch(() => {});
 }
 
-function updateEpicGameDetailsStatus(doc) {
-    if (!doc || doc.title !== "Steam" || !doc.body) return;
-
-    if (!doc.body.dataset.seObsAttached) {
-        doc.body.dataset.seObsAttached = "1";
-        try {
-            const obs = new MutationObserver(() => {
-                updateEpicGameDetailsStatus(doc);
-            });
-            obs.observe(doc.body, { childList: true, subtree: true });
-        } catch (_) {}
-    }
-
-    refreshUpdatesCacheAsync(doc);
-
+function syncSidebarEpicRows(doc) {
+    if (!doc || doc.title !== "Steam") return;
     const installedTitles = new Set(
         (cachedUpdatesData?.installedGames || []).map((g) => g.title)
     );
@@ -769,6 +756,24 @@ function updateEpicGameDetailsStatus(doc) {
             row.classList.remove("se-epic-uninstalled-row");
         }
     }
+}
+
+function updateEpicGameDetailsStatus(doc) {
+    if (!doc || doc.title !== "Steam" || !doc.body) return;
+
+    if (!doc.body.dataset.seObsAttached) {
+        doc.body.dataset.seObsAttached = "1";
+        try {
+            const obs = new MutationObserver(() => {
+                updateEpicGameDetailsStatus(doc);
+            });
+            obs.observe(doc.body, { childList: true, subtree: true, characterData: true });
+            doc.addEventListener("scroll", () => syncSidebarEpicRows(doc), { capture: true, passive: true });
+        } catch (_) {}
+    }
+
+    refreshUpdatesCacheAsync(doc);
+    syncSidebarEpicRows(doc);
 
     const histPath = window.MainWindowBrowserManager?.m_history?.location?.pathname || "";
     const m = histPath.match(/\/library\/app\/(\d+)/);
@@ -1163,11 +1168,17 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 7) return;
-    window.__SE_EPIC_VERSION = 7;
+    if (window.__SE_EPIC_VERSION === 8) return;
+    window.__SE_EPIC_VERSION = 8;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
+    try {
+        Array.from(g_PopupManager?.GetPopups?.() || []).forEach((p) => {
+            const d = (p?.m_wnd || p?.window)?.document;
+            if (d?.body?.dataset?.seObsAttached) delete d.body.dataset.seObsAttached;
+        });
+    } catch (_) {}
 
     refreshUpdatesCacheAsync(null);
 
