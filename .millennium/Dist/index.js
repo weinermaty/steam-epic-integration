@@ -1,15 +1,20 @@
 /**
  * Steam Epic Integration — Frontend
- * Uses Steam's native ContextMenuManager (bForcePopup: true) so the Epic dropdown
- * opens in a genuine OS/CEF popup window — identical to Steam's Account and Notifications
- * menus. It is never overlapped by the Store/Community BrowserView, automatically
- * repositions, closes on outside click/blur/Escape, and integrates cleanly into TitleBarControls.
+ * 1. Pre-Created Hidden Popup (bCreateHidden: true, bRetainOnHide: true) — opens in 0 ms on click,
+ *    matching Steam's native Notifications and Account menus.
+ * 2. Throttled, smart diffing for 350+ Epic games — never freezes or crashes Steam, skips already-added
+ *    games, and streams Epic cover artwork (capsule + hero) into Steam Library in the background.
+ * 3. Direct 1-step authenticated Epic checkout modal — uses Legendary's OAuth exchange token to log in
+ *    automatically in the background and open straight on the "Place Order" / Captcha dialog.
  */
 
 const PLUGIN_NAME = "steam-epic-integration";
 const LOCAL_DAEMON_URL = "http://127.0.0.1:49812";
 const STORAGE_KEY_SYNC = "se_epic_library_enabled";
 const STORAGE_KEY_APPIDS = "se_epic_shortcut_appids";
+const STORAGE_KEY_ART_DONE = "se_epic_artwork_applied_v1";
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function callBackend(method, args = {}) {
     if (window.Millennium && typeof window.Millennium.callServerMethod === "function") {
@@ -232,9 +237,10 @@ function getSteamPopupModules() {
         const React = req(63696);
         const ContextMenuMod = req(377);
         const MenuComponents = req(12711);
-        if (React && ContextMenuMod?.lX && MenuComponents?.tz) {
+        if (React && ContextMenuMod?.XX && MenuComponents?.tz) {
             return {
                 React,
+                contextMenuManager: ContextMenuMod.XX,
                 showContextMenu: ContextMenuMod.lX,
                 MenuContainer: MenuComponents.tz,
             };
@@ -244,9 +250,6 @@ function getSteamPopupModules() {
 }
 
 function openClaimPopup(url) {
-    // Never call window.open() inside Steam's SharedJSContext because Steam intercepts
-    // popup requests into its internal BrowserBackstack, which resets to data:text/html,<body></body>.
-    // Instead, open a dedicated native WebKit2/pywebview checkout window via our backend daemon.
     callBackend("OpenClaimWindow", { url }).catch(() => {
         if (window.SteamClient?.System?.OpenInSystemBrowser) {
             window.SteamClient.System.OpenInSystemBrowser(url);
@@ -266,18 +269,9 @@ function healBlankSteamBrowser() {
     } catch (_) {}
 }
 
-function getStoredEpicAppIds() {
-    try {
-        const raw = localStorage.getItem(STORAGE_KEY_APPIDS);
-        const arr = raw ? JSON.parse(raw) : [];
-        return Array.isArray(arr) ? arr : [];
-    } catch (_) {
-        return [];
-    }
-}
-
-function findExistingEpicShortcuts() {
-    const ids = new Set(getStoredEpicAppIds());
+function getExistingEpicShortcutsMap() {
+    // Returns Map<displayName, appid> for all existing "(Epic)" shortcuts in Steam's appStore
+    const map = new Map();
     try {
         const apps = window.appStore?.allApps || [];
         for (const app of apps) {
@@ -289,114 +283,217 @@ function findExistingEpicShortcuts() {
             if (!isShortcut) continue;
             const name = app.display_name || "";
             if (name.endsWith(" (Epic)")) {
-                ids.add(app.appid);
+                map.set(name, app.appid);
             }
         }
     } catch (_) {}
-    return Array.from(ids);
+    return map;
+}
+
+let isSyncInProgress = false;
+let artworkStreamGeneration = 0;
+
+async function streamEpicCoverArtInBackground(gamesWithIds, onProgressText) {
+    const myGen = ++artworkStreamGeneration;
+
+    // 1. Trigger disk caching into ~/.steam/steam/userdata/*/config/grid/ via backend
+    callBackend("CacheSteamGridArtwork", { items: gamesWithIds }).catch(() => {});
+
+    if (!window.SteamClient?.Apps?.SetCustomArtworkForApp) return;
+
+    let doneSet = {};
+    try {
+        doneSet = JSON.parse(localStorage.getItem(STORAGE_KEY_ART_DONE) || "{}");
+    } catch (_) {
+        doneSet = {};
+    }
+
+    const pending = gamesWithIds.filter((g) => g.tallCover && !doneSet[g.appid]);
+    if (pending.length === 0) return;
+
+    let doneCount = gamesWithIds.length - pending.length;
+    for (const item of pending) {
+        if (myGen !== artworkStreamGeneration) return;
+        try {
+            const res = await callBackend("GetArtworkBase64", {
+                appName: item.appName,
+                kind: "tall",
+                url: item.tallCover,
+            });
+            if (res?.ok && res.base64) {
+                // eAssetType 0 = vertical Library Capsule, 3 = landscape Header
+                await window.SteamClient.Apps.SetCustomArtworkForApp(item.appid, res.base64, "jpg", 0);
+                doneSet[item.appid] = 1;
+                doneCount++;
+                if (doneCount % 10 === 0) {
+                    localStorage.setItem(STORAGE_KEY_ART_DONE, JSON.stringify(doneSet));
+                    if (onProgressText) {
+                        onProgressText(`Epic v Knihovně (${gamesWithIds.length} her • obaly ${doneCount}/${gamesWithIds.length})`);
+                    }
+                }
+            }
+        } catch (_) {}
+        await sleep(35);
+    }
+    localStorage.setItem(STORAGE_KEY_ART_DONE, JSON.stringify(doneSet));
+    if (onProgressText) {
+        onProgressText(`Epic hry v Knihovně (${gamesWithIds.length} her)`);
+    }
 }
 
 async function applyEpicShortcutsToSteam(enable, onProgressText) {
-    if (!window.SteamClient?.Apps?.AddShortcut || !window.SteamClient?.Apps?.RemoveShortcut) {
-        await callBackend("SyncSteamShortcuts");
-        return;
-    }
-
-    if (!enable) {
-        if (onProgressText) onProgressText("Odebírám Epic hry ze Steamu…");
-        const toRemove = findExistingEpicShortcuts();
-        for (const appid of toRemove) {
-            try {
-                window.SteamClient.Apps.RemoveShortcut(appid);
-            } catch (_) {}
+    if (isSyncInProgress) return;
+    isSyncInProgress = true;
+    try {
+        if (!window.SteamClient?.Apps?.AddShortcut || !window.SteamClient?.Apps?.RemoveShortcut) {
+            await callBackend("SyncSteamShortcuts");
+            return;
         }
-        localStorage.setItem(STORAGE_KEY_APPIDS, "[]");
-        localStorage.setItem(STORAGE_KEY_SYNC, "0");
-        if (onProgressText) onProgressText("Zobrazit Epic hry ve Steam Knihovně");
-        return;
-    }
 
-    if (onProgressText) onProgressText("Načítám hry z tvého Epicu…");
-    const lib = await callBackend("GetEpicLibrary");
-    if (!lib.authenticated) {
-        if (onProgressText) onProgressText("Nejprve se přihlas k Epicu výše");
-        return;
-    }
-
-    const oldIds = findExistingEpicShortcuts();
-    for (const appid of oldIds) {
-        try {
-            window.SteamClient.Apps.RemoveShortcut(appid);
-        } catch (_) {}
-    }
-
-    const helperPath = lib.helperPath || "/home/maty/Epic Steam/backend/epic_helper.py";
-    const startDir = helperPath.substring(0, helperPath.lastIndexOf("/")) || "/usr/bin";
-    const createdIds = [];
-
-    for (const game of lib.games || []) {
-        try {
-            const displayName = `${game.title} (Epic)`;
-            const args = `launch ${game.appName}`;
-            const cmdline = `"${helperPath}" ${args}`;
-            const appid = await window.SteamClient.Apps.AddShortcut(
-                displayName,
-                helperPath,
-                args,
-                cmdline
-            );
-            if (appid) {
-                window.SteamClient.Apps.SetShortcutName?.(appid, displayName);
-                window.SteamClient.Apps.SetShortcutExe?.(appid, `"${helperPath}"`);
-                window.SteamClient.Apps.SetShortcutStartDir?.(appid, `"${startDir}"`);
-                window.SteamClient.Apps.SetShortcutLaunchOptions?.(appid, args);
-                createdIds.push(appid);
+        if (!enable) {
+            artworkStreamGeneration++;
+            const existingMap = getExistingEpicShortcutsMap();
+            const toRemove = Array.from(existingMap.values());
+            let idx = 0;
+            for (const appid of toRemove) {
+                try {
+                    window.SteamClient.Apps.RemoveShortcut(appid);
+                } catch (_) {}
+                idx++;
+                if (idx % 15 === 0) {
+                    if (onProgressText) onProgressText(`Schovávám Epic hry (${idx}/${toRemove.length})…`);
+                    await sleep(25);
+                }
             }
-        } catch (_) {}
-    }
+            localStorage.setItem(STORAGE_KEY_APPIDS, "[]");
+            localStorage.setItem(STORAGE_KEY_SYNC, "0");
+            if (onProgressText) onProgressText("Zobrazit Epic hry ve Steam Knihovně");
+            return;
+        }
 
-    localStorage.setItem(STORAGE_KEY_APPIDS, JSON.stringify(createdIds));
-    localStorage.setItem(STORAGE_KEY_SYNC, "1");
-    if (onProgressText) {
-        onProgressText(`Epic hry v Knihovně (${createdIds.length} her)`);
+        if (onProgressText) onProgressText("Načítám Epic knihovnu…");
+        const lib = await callBackend("GetEpicLibrary");
+        if (!lib.authenticated) {
+            if (onProgressText) onProgressText("Nejprve se přihlas k Epicu výše");
+            return;
+        }
+
+        const existingMap = getExistingEpicShortcutsMap();
+        const helperPath = lib.helperPath || "/home/maty/Epic Steam/backend/epic_helper.py";
+        const startDir = helperPath.substring(0, helperPath.lastIndexOf("/")) || "/usr/bin";
+        const allGames = lib.games || [];
+        const finalIds = [];
+        const artworkQueue = [];
+
+        let processed = 0;
+        for (const game of allGames) {
+            const displayName = `${game.title} (Epic)`;
+            let appid = existingMap.get(displayName);
+
+            if (!appid) {
+                try {
+                    const args = `launch ${game.appName}`;
+                    const cmdline = `"${helperPath}" ${args}`;
+                    appid = await window.SteamClient.Apps.AddShortcut(
+                        displayName,
+                        helperPath,
+                        args,
+                        cmdline
+                    );
+                    if (appid) {
+                        window.SteamClient.Apps.SetShortcutName?.(appid, displayName);
+                        window.SteamClient.Apps.SetShortcutExe?.(appid, `"${helperPath}"`);
+                        window.SteamClient.Apps.SetShortcutStartDir?.(appid, `"${startDir}"`);
+                        window.SteamClient.Apps.SetShortcutLaunchOptions?.(appid, args);
+                    }
+                    // Yield to Steam IPC every added shortcut so 350+ games never flood or crash Steam
+                    await sleep(18);
+                } catch (_) {}
+            }
+
+            if (appid) {
+                finalIds.push(appid);
+                artworkQueue.push({
+                    appid,
+                    appName: game.appName,
+                    tallCover: game.tallCover,
+                    wideCover: game.wideCover,
+                });
+            }
+
+            processed++;
+            if (processed % 25 === 0 && onProgressText) {
+                onProgressText(`Synchronizuji Epic (${processed}/${allGames.length})…`);
+            }
+        }
+
+        localStorage.setItem(STORAGE_KEY_APPIDS, JSON.stringify(finalIds));
+        localStorage.setItem(STORAGE_KEY_SYNC, "1");
+        if (onProgressText) {
+            onProgressText(`Epic hry v Knihovně (${finalIds.length} her)`);
+        }
+
+        // Stream cover art in the background without blocking the UI
+        streamEpicCoverArtInBackground(artworkQueue, onProgressText);
+    } finally {
+        isSyncInProgress = false;
     }
 }
 
-function createEpicPopupComponent(React, MenuContainer, initialFreeGames, onFreeDetected, closeMenuFn) {
+// Pre-fetched state so popup renders in 0ms on click
+let preloadedState = {
+    auth: { authenticated: false, displayName: null },
+    freeGames: [],
+    ready: false,
+};
+const stateSubscribers = new Set();
+
+function notifyStateSubscribers() {
+    for (const cb of stateSubscribers) {
+        try {
+            cb({ ...preloadedState });
+        } catch (_) {}
+    }
+}
+
+async function refreshPreloadedState(dotEl) {
+    try {
+        const [authRes, freeRes] = await Promise.all([
+            callBackend("GetAuthStatus"),
+            callBackend("GetFreeGames"),
+        ]);
+        preloadedState = {
+            auth: authRes || { authenticated: false },
+            freeGames: freeRes?.games || [],
+            ready: true,
+        };
+        if (dotEl && preloadedState.freeGames.length > 0) {
+            dotEl.classList.add("se-visible");
+        }
+        notifyStateSubscribers();
+    } catch (_) {}
+}
+
+function createEpicPopupComponent(React, MenuContainer, getCloseFn) {
     return function EpicMenuPopup() {
-        const [loading, setLoading] = React.useState(true);
-        const [auth, setAuth] = React.useState({ authenticated: false, displayName: null });
-        const [freeGames, setFreeGames] = React.useState(initialFreeGames || []);
+        const [snap, setSnap] = React.useState(preloadedState);
         const [syncOn, setSyncOn] = React.useState(localStorage.getItem(STORAGE_KEY_SYNC) === "1");
         const [syncText, setSyncText] = React.useState(() => {
-            const isOn = localStorage.getItem(STORAGE_KEY_SYNC) === "1";
+            const existingCount = getExistingEpicShortcutsMap().size;
+            const isOn = localStorage.getItem(STORAGE_KEY_SYNC) === "1" || existingCount > 0;
             return isOn
-                ? `Epic hry v Knihovně (${getStoredEpicAppIds().length} her)`
+                ? `Epic hry v Knihovně (${existingCount} her)`
                 : "Zobrazit Epic hry ve Steam Knihovně";
         });
         const [loggingIn, setLoggingIn] = React.useState(false);
 
         React.useEffect(() => {
-            let mounted = true;
-            Promise.all([
-                callBackend("GetAuthStatus"),
-                initialFreeGames ? Promise.resolve({ ok: true, games: initialFreeGames }) : callBackend("GetFreeGames"),
-            ])
-                .then(([authRes, freeRes]) => {
-                    if (!mounted) return;
-                    setAuth(authRes || { authenticated: false });
-                    if (freeRes?.games) {
-                        setFreeGames(freeRes.games);
-                        if (freeRes.games.length > 0 && onFreeDetected) onFreeDetected();
-                    }
-                    setLoading(false);
-                })
-                .catch(() => {
-                    if (mounted) setLoading(false);
-                });
-            return () => {
-                mounted = false;
-            };
+            const sub = (nextSnap) => setSnap(nextSnap);
+            stateSubscribers.add(sub);
+            if (!preloadedState.ready) {
+                refreshPreloadedState(null);
+            }
+            return () => stateSubscribers.delete(sub);
         }, []);
 
         React.useEffect(() => {
@@ -407,7 +504,8 @@ function createEpicPopupComponent(React, MenuContainer, initialFreeGames, onFree
                     if (st?.authenticated) {
                         clearInterval(timer);
                         setLoggingIn(false);
-                        setAuth(st);
+                        preloadedState.auth = st;
+                        notifyStateSubscribers();
                         setSyncOn(true);
                         await applyEpicShortcutsToSteam(true, setSyncText);
                     }
@@ -425,14 +523,19 @@ function createEpicPopupComponent(React, MenuContainer, initialFreeGames, onFree
             setSyncOn(false);
             await applyEpicShortcutsToSteam(false, setSyncText);
             await callBackend("AuthenticateEpic", { auth_code: "logout" });
-            setAuth({ authenticated: false, displayName: null });
+            preloadedState.auth = { authenticated: false, displayName: null };
+            notifyStateSubscribers();
         };
 
         const handleToggleSync = async () => {
+            if (isSyncInProgress) return;
             const next = !syncOn;
             setSyncOn(next);
             await applyEpicShortcutsToSteam(next, setSyncText);
         };
+
+        const auth = snap.auth;
+        const freeGames = snap.freeGames;
 
         return React.createElement(
             MenuContainer,
@@ -491,7 +594,7 @@ function createEpicPopupComponent(React, MenuContainer, initialFreeGames, onFree
                     "div",
                     { className: "se-body" },
                     React.createElement("div", { className: "se-section-title" }, "Právě zdarma na Epicu"),
-                    loading
+                    !snap.ready && freeGames.length === 0
                         ? React.createElement("div", { className: "se-muted" }, "Načítání…")
                         : freeGames.length === 0
                         ? React.createElement("div", { className: "se-muted" }, "Momentálně nejsou žádné free hry.")
@@ -511,8 +614,9 @@ function createEpicPopupComponent(React, MenuContainer, initialFreeGames, onFree
                                           {
                                               className: "se-btn se-btn-primary",
                                               onClick: () => {
-                                                  if (closeMenuFn) closeMenuFn();
-                                                  openClaimPopup(g.storeUrl);
+                                                  const closeFn = getCloseFn();
+                                                  if (closeFn) closeFn();
+                                                  openClaimPopup(g.checkoutUrl || g.storeUrl);
                                               },
                                           },
                                           "Vyzvednout zdarma"
@@ -571,9 +675,51 @@ function injectIntoWindow(win) {
         return;
     }
 
-    let cachedFreeGames = null;
-    let activeMenuInstance = null;
+    let retainedMenuInstance = null;
     let lastHideTimestamp = 0;
+
+    function ensurePrewarmedPopup() {
+        if (retainedMenuInstance) return retainedMenuInstance;
+        const mods = getSteamPopupModules();
+        if (!mods) return null;
+
+        const { React, contextMenuManager, MenuContainer } = mods;
+        const mgr = contextMenuManager.GetContextMenuManagerFromWindow(btn);
+        if (!mgr || !mgr.CreateContextMenuInstance) return null;
+
+        const EpicPopup = createEpicPopupComponent(React, MenuContainer, () => () => {
+            if (retainedMenuInstance?.visible) retainedMenuInstance.Hide();
+        });
+
+        // Pre-create hidden popup window (bCreateHidden + bRetainOnHide) just like Steam's Bell & Account menu!
+        retainedMenuInstance = mgr.CreateContextMenuInstance(
+            React.createElement(EpicPopup, null),
+            btn,
+            undefined,
+            undefined,
+            {
+                bOverlapHorizontal: true,
+                bForcePopup: true,
+                bDisableMouseOverlay: true,
+                bCreateHidden: true,
+                bRetainOnHide: true,
+                title: "Epic Games Integration",
+            }
+        );
+
+        if (retainedMenuInstance?.SetOnHideCallback) {
+            retainedMenuInstance.SetOnHideCallback(() => {
+                lastHideTimestamp = Date.now();
+                btn.classList.remove("se-active");
+            });
+        }
+        return retainedMenuInstance;
+    }
+
+    // Pre-warm the popup window in idle time right after button mounts
+    setTimeout(() => {
+        ensurePrewarmedPopup();
+    }, 600);
 
     btn.addEventListener("mousedown", (ev) => {
         ev.stopPropagation();
@@ -583,66 +729,39 @@ function injectIntoWindow(win) {
         ev.preventDefault();
         ev.stopPropagation();
 
-        // If menu was open or just closed by blur on this mousedown, toggle off cleanly
-        if (activeMenuInstance?.visible || Date.now() - lastHideTimestamp < 220) {
-            if (activeMenuInstance?.visible) {
-                activeMenuInstance.Hide();
-            }
-            activeMenuInstance = null;
+        const inst = ensurePrewarmedPopup();
+        if (!inst) return;
+
+        if (inst.visible || Date.now() - lastHideTimestamp < 220) {
+            if (inst.visible) inst.Hide();
             btn.classList.remove("se-active");
             return;
         }
 
-        const mods = getSteamPopupModules();
-        if (!mods) return;
-
-        const { React, showContextMenu, MenuContainer } = mods;
-        const EpicPopup = createEpicPopupComponent(
-            React,
-            MenuContainer,
-            cachedFreeGames,
-            () => dot.classList.add("se-visible"),
-            () => {
-                if (activeMenuInstance?.visible) activeMenuInstance.Hide();
-            }
-        );
-
         btn.classList.add("se-active");
-        activeMenuInstance = showContextMenu(React.createElement(EpicPopup, null), btn, {
-            bOverlapHorizontal: true,
-            bForcePopup: true,
-            bDisableMouseOverlay: true,
-            title: "Epic Games Integration",
-        });
-
-        if (activeMenuInstance?.SetOnHideCallback) {
-            activeMenuInstance.SetOnHideCallback(() => {
-                lastHideTimestamp = Date.now();
-                activeMenuInstance = null;
-                btn.classList.remove("se-active");
-            });
-        }
+        inst.Show();
+        refreshPreloadedState(dot);
     });
 
-    callBackend("GetFreeGames")
-        .then((res) => {
-            if (res?.ok && Array.isArray(res.games)) {
-                cachedFreeGames = res.games;
-                if (res.games.length > 0) {
-                    dot.classList.add("se-visible");
-                }
-            }
-            const mods = getSteamPopupModules();
-            const r = btn.getBoundingClientRect();
-            callBackend("debug_set", {
-                injected: true,
-                parentClass: btn.parentElement?.className || "",
-                btnRect: { left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) },
-                hasPopupModules: !!mods,
-                freeCount: cachedFreeGames?.length || 0,
-            }).catch(() => {});
-        })
-        .catch(() => {});
+    refreshPreloadedState(dot).then(() => {
+        // If user already had Epic library synced, resume background cover artwork streaming automatically
+        const existingCount = getExistingEpicShortcutsMap().size;
+        if (existingCount > 0) {
+            localStorage.setItem(STORAGE_KEY_SYNC, "1");
+            applyEpicShortcutsToSteam(true, null);
+        }
+        const mods = getSteamPopupModules();
+        const r = btn.getBoundingClientRect();
+        callBackend("debug_set", {
+            injected: true,
+            parentClass: btn.parentElement?.className || "",
+            btnRect: { left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) },
+            hasPopupModules: !!mods,
+            prewarmedPopup: !!retainedMenuInstance,
+            existingEpicShortcuts: existingCount,
+            freeCount: preloadedState.freeGames.length,
+        }).catch(() => {});
+    });
 }
 
 function initPlugin() {

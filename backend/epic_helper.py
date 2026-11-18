@@ -2,14 +2,16 @@
 """
 Backend helper & local daemon for steam-epic-integration.
 Handles:
-1. Fetching active Epic Games Store free games promotions.
-2. Reading Epic Games library & auth status via Legendary CLI.
-3. Seamless 1-click Epic Games login via native WebKit2/pywebview window (no manual code copying).
-4. Syncing / unsyncing Epic Games in Steam's shortcuts.vdf + providing executable paths for live SteamClient.Apps.AddShortcut/RemoveShortcut.
-5. Installing / Launching Epic games via Legendary CLI (auto-installs if not yet installed when launched from Steam Library).
+1. Fetching active Epic Games Store free games promotions (with offerId & namespace for direct 1-step checkout).
+2. Reading Epic Games library & auth status instantly from cached ~/.config/legendary/metadata/*.json (including tall/wide cover artwork URLs).
+3. Seamless 1-click Epic Games login via native WebKit2/pywebview window.
+4. Direct 1-step free game claim window: automatically exchanges Legendary OAuth token for a web session inside WebKit2 and redirects straight to the Epic checkout modal (`https://www.epicgames.com/store/purchase?...`), skipping store navigation and re-login so the user only confirms the order / captcha.
+5. Background Steam artwork downloader: caches Epic cover images into ~/.steam/steam/userdata/*/config/grid/<appid>p.jpg & <appid>_hero.jpg + returns base64 thumbnails on demand.
 """
 
+import base64
 import binascii
+import concurrent.futures
 import glob
 import http.server
 import json
@@ -35,6 +37,10 @@ FRONTEND_SRC = os.path.join(
     "frontend",
     "index.js",
 )
+ARTWORK_CACHE_DIR = os.path.expanduser("~/.cache/steam-epic-integration/artwork")
+
+LAST_DEBUG_REPORT = {}
+_CACHED_FREE = {"ts": 0.0, "data": None}
 
 
 def find_legendary() -> str:
@@ -48,6 +54,9 @@ def find_legendary() -> str:
 
 
 def get_free_games() -> dict:
+    now = time.time()
+    if _CACHED_FREE["data"] and now - _CACHED_FREE["ts"] < 300:
+        return _CACHED_FREE["data"]
     try:
         req = urllib.request.Request(
             EPIC_FREE_GAMES_URL,
@@ -95,22 +104,35 @@ def get_free_games() -> dict:
             if not img_url and el.get("keyImages"):
                 img_url = el["keyImages"][0].get("url", "")
 
+            offer_id = el.get("id", "")
+            namespace = el.get("namespace", "")
             store_url = (
                 f"https://store.epicgames.com/en-US/p/{slug}"
                 if slug
                 else "https://store.epicgames.com/en-US/free-games"
             )
+            checkout_url = (
+                f"https://www.epicgames.com/store/purchase?highlightColor=0078f2"
+                f"&offers=1-{namespace}-{offer_id}&orderId&purchaseToken&showNavigation=true"
+                if offer_id and namespace
+                else store_url
+            )
             games.append(
                 {
-                    "id": el.get("id", ""),
+                    "id": offer_id,
+                    "namespace": namespace,
                     "title": el.get("title", "Unknown Game"),
                     "description": el.get("description", ""),
                     "image": img_url,
                     "endDate": offer.get("endDate", ""),
                     "storeUrl": store_url,
+                    "checkoutUrl": checkout_url,
                 }
             )
-        return {"ok": True, "games": games}
+        res = {"ok": True, "games": games}
+        _CACHED_FREE["ts"] = now
+        _CACHED_FREE["data"] = res
+        return res
     except Exception as exc:
         return {"ok": False, "error": str(exc), "games": []}
 
@@ -141,7 +163,6 @@ def get_epic_library() -> dict:
             "games": [],
         }
 
-    leg = find_legendary()
     installed_map = {}
     installed_json = os.path.expanduser("~/.config/legendary/installed.json")
     if os.path.isfile(installed_json):
@@ -151,37 +172,68 @@ def get_epic_library() -> dict:
         except Exception:
             installed_map = {}
 
-    try:
-        proc = subprocess.run(
-            [leg, "list", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=25,
-        )
-        items = json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout else []
-    except Exception as exc:
-        return {
-            "ok": False,
-            "authenticated": True,
-            "helperPath": helper_path,
-            "error": str(exc),
-            "games": [],
-        }
+    meta_dir = os.path.expanduser("~/.config/legendary/metadata")
+    meta_files = glob.glob(os.path.join(meta_dir, "*.json"))
+
+    # If metadata directory is empty on first run, populate it once via legendary list
+    if not meta_files:
+        try:
+            subprocess.run(
+                [find_legendary(), "list", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=25,
+            )
+            meta_files = glob.glob(os.path.join(meta_dir, "*.json"))
+        except Exception:
+            pass
 
     games = []
-    for item in items:
-        if item.get("is_dlc"):
-            continue
-        app_name = item.get("app_name", "")
-        title = item.get("app_title", app_name)
-        games.append(
-            {
-                "appName": app_name,
-                "title": title,
-                "installed": app_name in installed_map,
-                "installPath": installed_map.get(app_name, {}).get("install_path", ""),
+    for mf in meta_files:
+        try:
+            with open(mf, "r", encoding="utf-8") as f:
+                item = json.load(f)
+            meta = item.get("metadata", {})
+            # Skip DLCs / non-game items without asset_infos
+            if meta.get("mainGameItem") or not item.get("asset_infos"):
+                continue
+            app_name = item.get("app_name", "")
+            title = item.get("app_title") or meta.get("title") or app_name
+            if not app_name or not title:
+                continue
+
+            pics = {
+                p.get("type"): p.get("url")
+                for p in meta.get("keyImages", [])
+                if p.get("type") and p.get("url")
             }
-        )
+            tall_url = (
+                pics.get("DieselGameBoxTall")
+                or pics.get("OfferImageTall")
+                or pics.get("Thumbnail")
+                or ""
+            )
+            wide_url = (
+                pics.get("DieselGameBox")
+                or pics.get("OfferImageWide")
+                or pics.get("DieselStoreFrontWide")
+                or tall_url
+            )
+            games.append(
+                {
+                    "appName": app_name,
+                    "title": title,
+                    "installed": app_name in installed_map,
+                    "installPath": installed_map.get(app_name, {}).get(
+                        "install_path", ""
+                    ),
+                    "tallCover": tall_url,
+                    "wideCover": wide_url,
+                }
+            )
+        except Exception:
+            continue
+
     games.sort(key=lambda g: (not g["installed"], g["title"].lower()))
     return {
         "ok": True,
@@ -190,6 +242,87 @@ def get_epic_library() -> dict:
         "helperPath": helper_path,
         "games": games,
     }
+
+
+def _download_artwork_bytes(app_name: str, kind: str, url: str) -> bytes:
+    if not url:
+        return b""
+    os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
+    safe_id = "".join(c for c in app_name if c.isalnum() or c in "-_")
+    cache_file = os.path.join(ARTWORK_CACHE_DIR, f"{safe_id}_{kind}.jpg")
+    if os.path.isfile(cache_file) and os.path.getsize(cache_file) > 256:
+        try:
+            with open(cache_file, "rb") as f:
+                return f.read()
+        except Exception:
+            pass
+
+    sep = "&" if "?" in url else "?"
+    sized_url = f"{url}{sep}h=600&w=400&resize=1" if kind == "tall" else f"{url}{sep}h=430&w=920&resize=1"
+    try:
+        req = urllib.request.Request(
+            sized_url,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) SteamClient"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = resp.read()
+        if len(data) > 256:
+            with open(cache_file, "wb") as f:
+                f.write(data)
+            return data
+    except Exception:
+        pass
+    return b""
+
+
+def cache_steam_grid_artwork(items: list) -> dict:
+    """
+    Given a list of {"appid": int, "appName": str, "tallCover": str, "wideCover": str},
+    downloads images in parallel and writes them to ~/.steam/steam/userdata/*/config/grid/
+    (<appid>p.jpg, <appid>.jpg, <appid>_hero.jpg).
+    """
+    grid_dirs = []
+    for cfg in glob.glob(os.path.expanduser("~/.steam/steam/userdata/*/config")):
+        gdir = os.path.join(cfg, "grid")
+        os.makedirs(gdir, exist_ok=True)
+        grid_dirs.append(gdir)
+
+    def _process_one(entry):
+        appid = entry.get("appid")
+        app_name = entry.get("appName", "")
+        if not appid or not app_name:
+            return False
+        tall_bytes = _download_artwork_bytes(app_name, "tall", entry.get("tallCover", ""))
+        wide_bytes = _download_artwork_bytes(app_name, "wide", entry.get("wideCover", ""))
+        for gdir in grid_dirs:
+            if tall_bytes:
+                for suffix in ("p.jpg", "p.png"):
+                    p = os.path.join(gdir, f"{appid}{suffix}")
+                    if not os.path.isfile(p):
+                        with open(p, "wb") as f:
+                            f.write(tall_bytes)
+            if wide_bytes:
+                for suffix in (".jpg", "_hero.jpg"):
+                    p = os.path.join(gdir, f"{appid}{suffix}")
+                    if not os.path.isfile(p):
+                        with open(p, "wb") as f:
+                            f.write(wide_bytes)
+        return True
+
+    threading.Thread(
+        target=lambda: list(
+            concurrent.futures.ThreadPoolExecutor(max_workers=8).map(_process_one, items)
+        ),
+        daemon=True,
+    ).start()
+    return {"ok": True, "queued": len(items)}
+
+
+def get_artwork_base64(app_name: str, kind: str, url: str) -> dict:
+    data = _download_artwork_bytes(app_name, kind, url)
+    if not data:
+        return {"ok": False}
+    return {"ok": True, "base64": base64.b64encode(data).decode("ascii")}
 
 
 def _vdf_str(key: str, val: str) -> bytes:
@@ -290,7 +423,6 @@ def launch_or_install_game(app_name: str) -> dict:
         )
         return {"ok": True, "action": "launched", "appName": app_name}
     else:
-        # Install first, then automatically launch once download completes
         cmd = f'"{leg}" install -y "{app_name}" && "{leg}" launch "{app_name}"'
         subprocess.Popen(
             ["/bin/sh", "-c", cmd],
@@ -308,7 +440,6 @@ def start_auth(code: str = "") -> dict:
         return {"ok": True, "authenticated": False}
 
     if not code:
-        # Spawn interactive pywebview login window (user just logs in, no code copying needed)
         env = os.environ.copy()
         env.setdefault("DISPLAY", ":0")
         subprocess.Popen(
@@ -343,6 +474,86 @@ def start_auth(code: str = "") -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def open_claim_window(target_url: str) -> dict:
+    """
+    Opens a compact checkout window pre-authenticated with the user's Legendary session!
+    1. Generates a fresh 1-time exchangeCode from LegendaryCore in the background.
+    2. Opens WebKit2 on https://www.epicgames.com/id/api/csrf, exchanges the token via
+       fetch('/id/api/exchange') so the browser receives authenticated Epic cookies
+       automatically (zero re-login!), and redirects straight to the direct purchase
+       checkout modal (`https://www.epicgames.com/store/purchase?...`).
+    """
+    if not target_url or "epicgames.com" not in target_url:
+        return {"ok": False, "error": "Invalid store URL"}
+
+    exchange_code = ""
+    try:
+        from legendary.core import LegendaryCore
+
+        core = LegendaryCore()
+        if core.login():
+            tok = core.egs.get_game_token()
+            exchange_code = tok.get("code", "") if isinstance(tok, dict) else ""
+    except Exception:
+        exchange_code = ""
+
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":0")
+    storage_dir = os.path.expanduser("~/.config/legendary/webview_session")
+    os.makedirs(storage_dir, exist_ok=True)
+
+    py_script = """
+import json, sys, webview
+
+target_url = sys.argv[1]
+exchange_code = sys.argv[2]
+storage_dir = sys.argv[3]
+
+boot_url = "https://www.epicgames.com/account/personal" if exchange_code else target_url
+win = webview.create_window("Epic Games — Potvrzení objednávky (0 Kč)", boot_url, width=540, height=720)
+state = {"done": False}
+
+def on_loaded():
+    if state["done"] or not exchange_code:
+        return
+    state["done"] = True
+    js = f'''
+    (async function() {{
+        try {{
+            await fetch("https://www.epicgames.com/id/api/csrf", {{ credentials: "include" }});
+            const m = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+            const xsrf = m ? decodeURIComponent(m[1]) : "";
+            await fetch("https://www.epicgames.com/id/api/exchange", {{
+                method: "POST",
+                credentials: "include",
+                headers: {{
+                    "Content-Type": "application/json",
+                    "X-XSRF-TOKEN": xsrf
+                }},
+                body: JSON.stringify({{ exchangeCode: {json.dumps(exchange_code)} }})
+            }});
+        }} catch (e) {{}}
+        window.location.replace({json.dumps(target_url)});
+    }})();
+    '''
+    try:
+        win.evaluate_js(js)
+    except Exception:
+        pass
+
+win.events.loaded += on_loaded
+webview.start(private_mode=False, storage_path=storage_dir)
+"""
+    subprocess.Popen(
+        [sys.executable, "-c", py_script, target_url, exchange_code, storage_dir],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return {"ok": True, "url": target_url, "autoLoggedIn": bool(exchange_code)}
+
+
 def ensure_steamui_injected() -> bool:
     try:
         if os.path.isfile(FRONTEND_SRC):
@@ -362,30 +573,8 @@ def ensure_steamui_injected() -> bool:
     return False
 
 
-LAST_DEBUG_REPORT = {}
-
-
-def open_claim_window(store_url: str) -> dict:
-    if not store_url or not store_url.startswith("https://store.epicgames.com/"):
-        return {"ok": False, "error": "Invalid store URL"}
-    env = os.environ.copy()
-    env.setdefault("DISPLAY", ":0")
-    py_code = (
-        "import sys, webview; "
-        "webview.create_window('Epic Games — Vyzvednout zdarma', sys.argv[1], width=1020, height=760); "
-        "webview.start()"
-    )
-    subprocess.Popen(
-        [sys.executable, "-c", py_code, store_url],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    return {"ok": True, "url": store_url}
-
-
-def dispatch_method(method: str, arg: str = "") -> dict:
+def dispatch_method(method: str, arg: str = "", extra: dict = None) -> dict:
+    extra = extra or {}
     if method in ("free", "GetFreeGames"):
         return get_free_games()
     if method in ("status", "GetAuthStatus"):
@@ -400,6 +589,14 @@ def dispatch_method(method: str, arg: str = "") -> dict:
         return start_auth(arg)
     if method in ("claim", "OpenClaimWindow"):
         return open_claim_window(arg)
+    if method == "CacheSteamGridArtwork":
+        return cache_steam_grid_artwork(extra.get("items") or [])
+    if method == "GetArtworkBase64":
+        return get_artwork_base64(
+            extra.get("appName", ""),
+            extra.get("kind", "tall"),
+            extra.get("url", ""),
+        )
     if method == "debug_get":
         return LAST_DEBUG_REPORT
     return {"ok": False, "error": f"Unknown method: {method}"}
@@ -427,7 +624,13 @@ class EpicRPCHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
         method = parsed.path.lstrip("/") or "GetFreeGames"
-        arg = (qs.get("arg") or qs.get("url") or qs.get("app_name") or qs.get("auth_code") or [""])[0]
+        arg = (
+            qs.get("arg")
+            or qs.get("url")
+            or qs.get("app_name")
+            or qs.get("auth_code")
+            or [""]
+        )[0]
         self._send_json(dispatch_method(method, arg))
 
     def do_POST(self):
@@ -445,11 +648,18 @@ class EpicRPCHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
         arg = ""
+        extra = {}
         if isinstance(args, dict):
-            arg = args.get("url") or args.get("app_name") or args.get("auth_code") or ""
+            extra = args
+            arg = (
+                args.get("url")
+                or args.get("app_name")
+                or args.get("auth_code")
+                or ""
+            )
         elif isinstance(args, str):
             arg = args
-        self._send_json(dispatch_method(method, arg))
+        self._send_json(dispatch_method(method, arg, extra))
 
 
 def run_daemon():
