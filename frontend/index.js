@@ -146,6 +146,10 @@ body[data-se-epic-uninstalled="1"] [class*="PlayButtonContainer"]:hover,
 body[data-se-epic-uninstalled="1"] [class*="PlayButton"]:hover {
     background: linear-gradient(90deg, #33adff 0%, #0077ee 100%) !important;
 }
+.se-epic-uninstalled-row,
+.se-epic-uninstalled-row * {
+    color: rgb(163, 170, 185) !important;
+}
 .se-epic-status-pill {
     display: inline-flex;
     align-items: center;
@@ -750,6 +754,22 @@ function updateEpicGameDetailsStatus(doc) {
         } catch (_) {}
     }
 
+    refreshUpdatesCacheAsync(doc);
+
+    const installedTitles = new Set(
+        (cachedUpdatesData?.installedGames || []).map((g) => g.title)
+    );
+    const sidebarRows = doc.querySelectorAll('[class*="GameListEntryContainer"]');
+    for (const row of sidebarRows) {
+        const txt = (row.textContent || "").trim();
+        if (txt.endsWith(" (Epic)")) {
+            const base = txt.slice(0, -7);
+            row.classList.toggle("se-epic-uninstalled-row", !installedTitles.has(base));
+        } else if (row.classList.contains("se-epic-uninstalled-row")) {
+            row.classList.remove("se-epic-uninstalled-row");
+        }
+    }
+
     const histPath = window.MainWindowBrowserManager?.m_history?.location?.pathname || "";
     const m = histPath.match(/\/library\/app\/(\d+)/);
     const selectedAppId = m ? Number(m[1]) : window.uiStore?.currentGameListSelection?.nAppId;
@@ -1140,8 +1160,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 5) return;
-    window.__SE_EPIC_VERSION = 5;
+    if (window.__SE_EPIC_VERSION === 6) return;
+    window.__SE_EPIC_VERSION = 6;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
