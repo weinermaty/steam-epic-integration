@@ -365,6 +365,26 @@ def ensure_steamui_injected() -> bool:
 LAST_DEBUG_REPORT = {}
 
 
+def open_claim_window(store_url: str) -> dict:
+    if not store_url or not store_url.startswith("https://store.epicgames.com/"):
+        return {"ok": False, "error": "Invalid store URL"}
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":0")
+    py_code = (
+        "import sys, webview; "
+        "webview.create_window('Epic Games — Vyzvednout zdarma', sys.argv[1], width=1020, height=760); "
+        "webview.start()"
+    )
+    subprocess.Popen(
+        [sys.executable, "-c", py_code, store_url],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return {"ok": True, "url": store_url}
+
+
 def dispatch_method(method: str, arg: str = "") -> dict:
     if method in ("free", "GetFreeGames"):
         return get_free_games()
@@ -378,6 +398,8 @@ def dispatch_method(method: str, arg: str = "") -> dict:
         return launch_or_install_game(arg)
     if method in ("auth", "AuthenticateEpic"):
         return start_auth(arg)
+    if method in ("claim", "OpenClaimWindow"):
+        return open_claim_window(arg)
     if method == "debug_get":
         return LAST_DEBUG_REPORT
     return {"ok": False, "error": f"Unknown method: {method}"}
@@ -405,7 +427,7 @@ class EpicRPCHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
         method = parsed.path.lstrip("/") or "GetFreeGames"
-        arg = (qs.get("arg") or qs.get("app_name") or qs.get("auth_code") or [""])[0]
+        arg = (qs.get("arg") or qs.get("url") or qs.get("app_name") or qs.get("auth_code") or [""])[0]
         self._send_json(dispatch_method(method, arg))
 
     def do_POST(self):
@@ -424,7 +446,7 @@ class EpicRPCHandler(http.server.BaseHTTPRequestHandler):
             return
         arg = ""
         if isinstance(args, dict):
-            arg = args.get("app_name") or args.get("auth_code") or ""
+            arg = args.get("url") or args.get("app_name") or args.get("auth_code") or ""
         elif isinstance(args, str):
             arg = args
         self._send_json(dispatch_method(method, arg))

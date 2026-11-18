@@ -244,15 +244,26 @@ function getSteamPopupModules() {
 }
 
 function openClaimPopup(url) {
-    const w = 1020;
-    const h = 740;
-    const left = Math.max(0, Math.round((window.screen.width - w) / 2));
-    const top = Math.max(0, Math.round((window.screen.height - h) / 2));
-    window.open(
-        url,
-        "EpicGamesStoreClaim",
-        `width=${w},height=${h},left=${left},top=${top},menubar=no,toolbar=no,location=no,status=no`
-    );
+    // Never call window.open() inside Steam's SharedJSContext because Steam intercepts
+    // popup requests into its internal BrowserBackstack, which resets to data:text/html,<body></body>.
+    // Instead, open a dedicated native WebKit2/pywebview checkout window via our backend daemon.
+    callBackend("OpenClaimWindow", { url }).catch(() => {
+        if (window.SteamClient?.System?.OpenInSystemBrowser) {
+            window.SteamClient.System.OpenInSystemBrowser(url);
+        }
+    });
+}
+
+function healBlankSteamBrowser() {
+    try {
+        const mgr = window.MainWindowBrowserManager;
+        if (!mgr || !mgr.m_browser) return;
+        const cur = mgr.DisplayURL || mgr.m_URL || "";
+        if (cur.startsWith("data:text/html") && mgr.m_history?.location?.pathname?.startsWith("/browser")) {
+            const tab = mgr.GetLastActiveTab?.() || "store";
+            mgr.ActivateTab?.(tab);
+        }
+    } catch (_) {}
 }
 
 function getStoredEpicAppIds() {
@@ -637,6 +648,7 @@ function injectIntoWindow(win) {
 function initPlugin() {
     setInterval(() => {
         try {
+            healBlankSteamBrowser();
             if (typeof g_PopupManager !== "undefined" && g_PopupManager.GetPopups) {
                 Array.from(g_PopupManager.GetPopups()).forEach((p) => {
                     const w = p?.m_wnd || p?.window;
