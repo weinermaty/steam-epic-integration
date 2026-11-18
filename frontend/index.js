@@ -1036,17 +1036,20 @@ function injectIntoWindow(win) {
     injectEpicDownloadsSection(doc);
     updateEpicGameDetailsStatus(doc);
 
+    let style = doc.getElementById("se-steam-styles");
+    if (!style) {
+        style = doc.createElement("style");
+        style.id = "se-steam-styles";
+        style.textContent = STEAM_BUTTON_CSS;
+        doc.head.appendChild(style);
+    } else if (style.textContent !== STEAM_BUTTON_CSS) {
+        style.textContent = STEAM_BUTTON_CSS;
+    }
+
     const existing = doc.querySelector(".se-top-btn");
     if (existing) {
         placeButtonInSteamTopBar(doc, existing);
         return;
-    }
-
-    if (!doc.getElementById("se-steam-styles")) {
-        const style = doc.createElement("style");
-        style.id = "se-steam-styles";
-        style.textContent = STEAM_BUTTON_CSS;
-        doc.head.appendChild(style);
     }
 
     const btn = doc.createElement("div");
@@ -1160,8 +1163,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 6) return;
-    window.__SE_EPIC_VERSION = 6;
+    if (window.__SE_EPIC_VERSION === 7) return;
+    window.__SE_EPIC_VERSION = 7;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
