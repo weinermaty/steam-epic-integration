@@ -166,23 +166,37 @@ body[data-se-epic-uninstalled="1"] [class*="PlayButton"]:hover {
 .se-epic-downloading-row * {
     color: #66c0f4 !important;
 }
+.se-epic-row {
+    position: relative !important;
+    padding-right: 26px !important;
+}
+.se-epic-row.se-epic-downloading-row {
+    padding-right: 56px !important;
+}
 .se-epic-row::after {
     content: attr(data-se-dl-pct);
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
     display: inline-flex;
     align-items: center;
-    height: 14px;
-    min-width: 14px;
-    margin-left: auto;
-    padding-left: 17px;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 2.2C2.5 1.65 2.95 1.2 3.5 1.2H12.5C13.05 1.2 13.5 1.65 13.5 2.2V10.1C13.5 10.6 13.25 11.06 12.83 11.33L8.55 14.12C8.21 14.34 7.79 14.34 7.45 14.12L3.17 11.33C2.75 11.06 2.5 10.6 2.5 10.1V2.2Z' fill='%232b384c' stroke='%2366c0f4' stroke-width='1.15'/%3E%3Cpath d='M9.3 3.6L5.7 8.2H8.1L6.7 12.1L10.4 7.3H8L9.3 3.6Z' fill='%2366c0f4'/%3E%3C/svg%3E");
+    height: 12px;
+    min-width: 12px;
+    padding-left: 16px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M3 2.2C3 1.7 3.4 1.3 3.9 1.3H12.1C12.6 1.3 13 1.7 13 2.2V9.8C13 10.3 12.75 10.75 12.35 11.02L8.45 13.7C8.18 13.88 7.82 13.88 7.55 13.7L3.65 11.02C3.25 10.75 3 10.3 3 9.8V2.2Z' stroke='%2366c0f4' stroke-width='1.3'/%3E%3Cpath d='M9.1 3.8L5.9 8.1H8L6.9 11.8L10.1 7.3H8L9.1 3.8Z' fill='%2366c0f4'/%3E%3C/svg%3E");
     background-position: left center;
-    background-size: 13px 13px;
+    background-size: 12px 12px;
     background-repeat: no-repeat;
     font-size: 11px;
-    font-weight: 700;
-    color: #1a9fff !important;
+    font-weight: 600;
+    color: #66c0f4 !important;
     opacity: 0.9;
-    flex-shrink: 0;
+    pointer-events: none;
+}
+.se-epic-row.se-epic-uninstalled-row::after {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M3 2.2C3 1.7 3.4 1.3 3.9 1.3H12.1C12.6 1.3 13 1.7 13 2.2V9.8C13 10.3 12.75 10.75 12.35 11.02L8.45 13.7C8.18 13.88 7.82 13.88 7.55 13.7L3.65 11.02C3.25 10.75 3 10.3 3 9.8V2.2Z' stroke='%23858e9e' stroke-width='1.3'/%3E%3Cpath d='M9.1 3.8L5.9 8.1H8L6.9 11.8L10.1 7.3H8L9.1 3.8Z' fill='%23858e9e'/%3E%3C/svg%3E");
+    opacity: 0.55;
 }
 .se-epic-status-pill {
     display: inline-flex;
@@ -1320,8 +1334,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 14) return;
-    window.__SE_EPIC_VERSION = 14;
+    if (window.__SE_EPIC_VERSION === 15) return;
+    window.__SE_EPIC_VERSION = 15;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
