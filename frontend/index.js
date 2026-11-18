@@ -799,50 +799,8 @@ function syncSidebarEpicRows(doc) {
     }
 }
 
-let heroPrewarmStarted = false;
-function prewarmEpicHeroImages(win) {
-    if (heroPrewarmStarted || !win || !window.appStore?.allApps) return;
-    heroPrewarmStarted = true;
-    const items = [];
-    for (const ov of window.appStore.allApps) {
-        if (!ov) continue;
-        const name = ov.display_name || "";
-        if (!name.endsWith(" (Epic)")) continue;
-        const v = ov.rt_custom_image_mtime;
-        if (v) {
-            items.push(`https://steamloopback.host/customimages/${ov.appid}_hero.jpg?v=${v}`);
-        }
-    }
-    if (items.length === 0) return;
-
-    let idx = 0;
-    const BATCH = 8;
-    const runNextBatch = () => {
-        if (idx >= items.length) return;
-        const slice = items.slice(idx, idx + BATCH);
-        idx += BATCH;
-        let left = slice.length;
-        const doneOne = () => {
-            if (--left <= 0) {
-                setTimeout(runNextBatch, 20);
-            }
-        };
-        for (const url of slice) {
-            const im = new win.Image();
-            im.onload = doneOne;
-            im.onerror = doneOne;
-            im.src = url;
-        }
-    };
-    setTimeout(runNextBatch, 300);
-}
-
 function updateEpicGameDetailsStatus(doc) {
     if (!doc || doc.title !== "Steam" || !doc.body) return;
-
-    if (doc.defaultView) {
-        prewarmEpicHeroImages(doc.defaultView);
-    }
 
     if (!doc.body.dataset.seObsAttached) {
         doc.body.dataset.seObsAttached = "1";
@@ -1258,8 +1216,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 10) return;
-    window.__SE_EPIC_VERSION = 10;
+    if (window.__SE_EPIC_VERSION === 11) return;
+    window.__SE_EPIC_VERSION = 11;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
