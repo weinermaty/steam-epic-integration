@@ -103,11 +103,8 @@ const STEAM_BUTTON_CSS = `
     display: inline-flex;
 }
 .se-dl-section {
-    margin: 12px 24px;
-    background: rgba(23, 29, 37, 0.75);
-    border: 1px solid #2a313c;
-    border-radius: 3px;
-    padding: 12px 16px;
+    margin: 16px 0 8px 0;
+    padding: 0 24px;
     font-family: "Motiva Sans", Arial, Helvetica, sans-serif;
     color: #dcdedf;
 }
@@ -115,32 +112,57 @@ const STEAM_BUTTON_CSS = `
     display: flex;
     align-items: center;
     justify-content: space-between;
+    padding-bottom: 8px;
     margin-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 .se-dl-title {
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.8px;
-    text-transform: uppercase;
-    color: #66c0f4;
+    font-size: 14px;
+    font-weight: 500;
+    color: #ffffff;
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 .se-dl-row {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    background: #23262e;
-    border: 1px solid #2d333d;
-    padding: 8px 12px;
+    gap: 14px;
+    background: rgba(33, 39, 49, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    padding: 10px 14px;
     border-radius: 2px;
-    margin-top: 6px;
+    margin-bottom: 6px;
+}
+.se-dl-thumb {
+    width: 86px;
+    height: 40px;
+    border-radius: 2px;
+    object-fit: cover;
+    background: #10151b;
+    flex-shrink: 0;
+}
+.se-dl-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+.se-dl-name-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    color: #ffffff;
 }
 .se-dl-bar-wrap {
-    width: 180px;
-    height: 6px;
+    width: 100%;
+    height: 4px;
     background: #10151b;
-    border-radius: 3px;
+    border-radius: 2px;
     overflow: hidden;
-    margin: 0 12px;
 }
 .se-dl-bar {
     height: 100%;
@@ -733,9 +755,9 @@ async function injectEpicDownloadsSection(doc) {
     if (!container) {
         container = doc.createElement("div");
         container.className = "se-dl-section";
-        const topBar = downloadsPage.querySelector("._373v1eWNyaPKhgnea9FZSt") || downloadsPage.firstChild;
-        if (topBar && topBar.nextSibling) {
-            downloadsPage.insertBefore(container, topBar.nextSibling);
+        const itemList = downloadsPage.querySelector("._1l0LmmqDUXH19SjfELddn7") || downloadsPage.querySelector('[class*="ItemListWrapper"]');
+        if (itemList) {
+            itemList.insertBefore(container, itemList.firstChild);
         } else {
             downloadsPage.appendChild(container);
         }
@@ -748,8 +770,8 @@ async function injectEpicDownloadsSection(doc) {
     const title = doc.createElement("div");
     title.className = "se-dl-title";
     title.textContent = tr(
-        `Epic Games Aktualizace & Stahování (${pending.length + active.length})`,
-        `Epic Games Updates & Downloads (${pending.length + active.length})`
+        `Stahování & Aktualizace (${pending.length + active.length})`,
+        `Downloads & Updates (${pending.length + active.length})`
     );
     const checkBtn = doc.createElement("button");
     checkBtn.className = "se-btn";
@@ -762,27 +784,51 @@ async function injectEpicDownloadsSection(doc) {
     hdr.append(title, checkBtn);
     container.appendChild(hdr);
 
+    const existingMap = getExistingEpicShortcutsMap();
+    const makeThumb = (gameTitle) => {
+        const appid = existingMap.get(`${gameTitle} (Epic)`);
+        if (!appid) return null;
+        const ov = window.appStore?.GetAppOverviewByAppID?.(appid);
+        const v = ov?.rt_custom_image_mtime;
+        if (!v) return null;
+        const img = doc.createElement("img");
+        img.className = "se-dl-thumb";
+        img.src = `https://steamloopback.host/customimages/${appid}_hero.jpg?v=${v}`;
+        img.onerror = () => img.remove();
+        return img;
+    };
+
     for (const trItem of active) {
         const row = doc.createElement("div");
         row.className = "se-dl-row";
-        const nameEl = doc.createElement("div");
-        nameEl.style.cssText = "font-weight:500;color:#fff;flex:1;";
-        nameEl.textContent = `${trItem.title} (Epic)`;
+        const thumb = makeThumb(trItem.title);
+        if (thumb) row.appendChild(thumb);
+
+        const main = doc.createElement("div");
+        main.className = "se-dl-main";
+
+        const nameRow = doc.createElement("div");
+        nameRow.className = "se-dl-name-row";
+        nameRow.textContent = trItem.title;
+
         const barWrap = doc.createElement("div");
         barWrap.className = "se-dl-bar-wrap";
         const bar = doc.createElement("div");
         bar.className = "se-dl-bar";
         bar.style.width = `${Math.min(100, Math.round(trItem.progress || 0))}%`;
         barWrap.appendChild(bar);
+
         const infoEl = doc.createElement("div");
         infoEl.className = "se-muted";
         infoEl.textContent =
             trItem.status === "completed"
-                ? tr("Dokončeno (100%)", "Completed (100%)")
+                ? tr("Dokončeno • 100%", "Completed • 100%")
                 : trItem.status === "failed"
                 ? tr("Chyba stahování", "Download failed")
-                : `${Math.round(trItem.progress || 0)}% ${trItem.speed ? "• " + trItem.speed : ""} ${trItem.eta ? "• ETA " + trItem.eta : ""}`;
-        row.append(nameEl, barWrap, infoEl);
+                : `${Math.round(trItem.progress || 0)}% ${trItem.speed ? "• " + trItem.speed : ""} ${trItem.eta ? "• " + trItem.eta : ""}`;
+
+        main.append(nameRow, barWrap, infoEl);
+        row.appendChild(main);
         container.appendChild(row);
     }
 
@@ -790,12 +836,22 @@ async function injectEpicDownloadsSection(doc) {
         if (active.some((a) => a.appName === up.appName)) continue;
         const row = doc.createElement("div");
         row.className = "se-dl-row";
-        const nameEl = doc.createElement("div");
-        nameEl.style.cssText = "font-weight:500;color:#fff;";
-        nameEl.textContent = tr(
-            `${up.title} (Epic) — dostupná verze ${up.latestVersion}`,
-            `${up.title} (Epic) — update available ${up.latestVersion}`
+        const thumb = makeThumb(up.title);
+        if (thumb) row.appendChild(thumb);
+
+        const main = doc.createElement("div");
+        main.className = "se-dl-main";
+        const nameRow = doc.createElement("div");
+        nameRow.className = "se-dl-name-row";
+        nameRow.textContent = up.title;
+        const infoEl = doc.createElement("div");
+        infoEl.className = "se-muted";
+        infoEl.textContent = tr(
+            `Dostupná aktualizace • ${up.latestVersion}`,
+            `Update available • ${up.latestVersion}`
         );
+        main.append(nameRow, infoEl);
+
         const updBtn = doc.createElement("button");
         updBtn.className = "se-btn se-btn-primary";
         updBtn.textContent = tr("Aktualizovat", "Update");
@@ -805,7 +861,7 @@ async function injectEpicDownloadsSection(doc) {
             lastDownloadsCheckTs = 0;
             injectEpicDownloadsSection(doc);
         };
-        row.append(nameEl, updBtn);
+        row.append(main, updBtn);
         container.appendChild(row);
     }
 }
@@ -1329,8 +1385,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 16) return;
-    window.__SE_EPIC_VERSION = 16;
+    if (window.__SE_EPIC_VERSION === 17) return;
+    window.__SE_EPIC_VERSION = 17;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
