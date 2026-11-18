@@ -315,9 +315,42 @@ def get_epic_updates_and_downloads(check_remote: bool = False) -> dict:
     }
 
 
+def _find_proton_binary() -> str:
+    candidates = [
+        os.path.expanduser("~/.steam/steam/steamapps/common/Proton - Experimental/proton"),
+    ]
+    candidates.extend(
+        sorted(glob.glob(os.path.expanduser("~/.steam/steam/steamapps/common/Proton*/proton")), reverse=True)
+    )
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return ""
+
+
+def _build_launch_cmd(leg: str, app_name: str, platform: str = "") -> tuple[list[str], dict[str, str]]:
+    env = os.environ.copy()
+    if platform.lower() == "linux" or shutil.which("wine"):
+        return [leg, "launch", app_name], env
+
+    proton_path = _find_proton_binary()
+    if not proton_path:
+        return [leg, "launch", app_name], env
+
+    safe_id = "".join(c for c in app_name if c.isalnum() or c in "-_")
+    pfx_dir = os.path.expanduser(f"~/.local/share/steam-epic-integration/pfx/{safe_id}")
+    os.makedirs(pfx_dir, exist_ok=True)
+    env["STEAM_COMPAT_DATA_PATH"] = pfx_dir
+    env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = os.path.expanduser("~/.steam/steam")
+    return [leg, "launch", "--no-wine", "--wrapper", f'"{proton_path}" run', app_name], env
+
+
 def _run_legendary_transfer(app_name: str, title: str, mode: str = "update", auto_launch: bool = False):
     leg = find_legendary()
     with _DOWNLOADS_LOCK:
+        existing = _ACTIVE_DOWNLOADS.get(app_name)
+        if existing and existing.get("status") == "downloading":
+            return
         _ACTIVE_DOWNLOADS[app_name] = {
             "appName": app_name,
             "title": title or app_name,
@@ -329,7 +362,13 @@ def _run_legendary_transfer(app_name: str, title: str, mode: str = "update", aut
             "updatedAt": time.time(),
         }
 
-    cmd = [leg, "update" if mode == "update" else "install", "-y", app_name]
+    if mode == "update":
+        cmd = [leg, "update", "-y", app_name]
+    else:
+        base_path = os.path.expanduser("~/Games/Epic")
+        os.makedirs(base_path, exist_ok=True)
+        cmd = [leg, "install", "-y", "--base-path", base_path, app_name]
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -372,8 +411,10 @@ def _run_legendary_transfer(app_name: str, title: str, mode: str = "update", aut
             entry["updatedAt"] = time.time()
 
     if ok and auto_launch:
+        launch_cmd, launch_env = _build_launch_cmd(leg, app_name)
         subprocess.Popen(
-            [leg, "launch", app_name],
+            launch_cmd,
+            env=launch_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -577,7 +618,7 @@ def sync_to_steam_shortcuts() -> dict:
     return {"ok": True, "syncedCount": len(entries), "paths": written}
 
 
-def launch_or_install_game(app_name: str, title: str = "") -> dict:
+def launch_or_install_game(app_name: str, title: str = "", blocking: bool = False) -> dict:
     if not app_name or not all(c.isalnum() or c in "-_." for c in app_name):
         return {"ok": False, "error": "Invalid app_name"}
 
@@ -585,13 +626,16 @@ def launch_or_install_game(app_name: str, title: str = "") -> dict:
     installed_json = os.path.expanduser("~/.config/legendary/installed.json")
     is_installed = False
     game_title = title or app_name
+    platform = ""
     if os.path.isfile(installed_json):
         try:
             with open(installed_json, "r", encoding="utf-8") as f:
                 inst_data = json.load(f)
                 is_installed = app_name in inst_data
-                if is_installed and not title:
-                    game_title = inst_data[app_name].get("title", app_name)
+                if is_installed:
+                    if not title:
+                        game_title = inst_data[app_name].get("title", app_name)
+                    platform = inst_data[app_name].get("platform", "")
         except Exception:
             pass
 
@@ -605,6 +649,7 @@ def launch_or_install_game(app_name: str, title: str = "") -> dict:
             ig = core.get_installed_game(app_name)
             if ig:
                 game_title = ig.title or game_title
+                platform = ig.platform or platform
                 asset = core.get_asset(app_name, platform=ig.platform)
                 if asset and asset.build_version and asset.build_version != ig.version:
                     needs_update = True
@@ -612,26 +657,45 @@ def launch_or_install_game(app_name: str, title: str = "") -> dict:
             pass
 
         if needs_update:
-            threading.Thread(
-                target=_run_legendary_transfer,
-                args=(app_name, game_title, "update", True),
-                daemon=True,
-            ).start()
+            if blocking:
+                _run_legendary_transfer(app_name, game_title, "update", True)
+            else:
+                threading.Thread(
+                    target=_run_legendary_transfer,
+                    args=(app_name, game_title, "update", True),
+                    daemon=True,
+                ).start()
             return {"ok": True, "action": "updating_and_launching", "appName": app_name}
 
-        subprocess.Popen(
-            [leg, "launch", app_name],
+        launch_cmd, launch_env = _build_launch_cmd(leg, app_name, platform=platform)
+        proc = subprocess.Popen(
+            launch_cmd,
+            env=launch_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        if blocking:
+            proc.wait()
         return {"ok": True, "action": "launched", "appName": app_name}
     else:
-        threading.Thread(
-            target=_run_legendary_transfer,
-            args=(app_name, game_title, "install", True),
-            daemon=True,
-        ).start()
+        if not title:
+            try:
+                from legendary.core import LegendaryCore
+
+                g = LegendaryCore().get_game(app_name)
+                if g and getattr(g, "app_title", None):
+                    game_title = g.app_title
+            except Exception:
+                pass
+        if blocking:
+            _run_legendary_transfer(app_name, game_title, "install", True)
+        else:
+            threading.Thread(
+                target=_run_legendary_transfer,
+                args=(app_name, game_title, "install", True),
+                daemon=True,
+            ).start()
         return {"ok": True, "action": "installing", "appName": app_name}
 
 
@@ -1038,6 +1102,20 @@ def main():
     if cmd == "inject":
         changed = ensure_steamui_injected()
         print(json.dumps({"ok": True, "injected": changed}))
+        return
+    if cmd == "launch" and arg:
+        try:
+            url = f"http://127.0.0.1:{DAEMON_PORT}/LaunchOrInstallEpicGame?app_name={urllib.parse.quote(arg)}"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("ok"):
+                    print(json.dumps(data, ensure_ascii=False))
+                    return
+        except Exception:
+            pass
+        res = launch_or_install_game(arg, blocking=True)
+        print(json.dumps(res, ensure_ascii=False))
         return
 
     res = dispatch_method(cmd, arg)
