@@ -1,26 +1,39 @@
 #!/usr/bin/env python3
 """
-Backend helper for steam-epic-integration Millennium plugin.
+Backend helper & local daemon for steam-epic-integration.
 Handles:
 1. Fetching active Epic Games Store free games promotions.
 2. Reading Epic Games library & auth status via Legendary CLI.
 3. Syncing Epic Games directly into Steam's shortcuts.vdf (Non-Steam Games) so they launch via `legendary launch <app_name>` without Epic Games Launcher.
 4. Installing / Launching Epic games via Legendary CLI.
+5. Running as a lightweight localhost HTTP server (127.0.0.1:49812) + auto-patching Steam UI's index.html so the extension works on any Linux distro even when Millennium's binary requires newer GLIBC.
 """
 
 import binascii
 import glob
+import http.server
 import json
 import os
 import shutil
 import struct
 import subprocess
 import sys
+import threading
+import time
+import urllib.parse
 import urllib.request
 
 EPIC_FREE_GAMES_URL = (
     "https://store-site-backend-static.ak.epicgames.com/"
     "freeGamesPromotions?locale=en-US&country=CZ&allowCountries=CZ"
+)
+DAEMON_PORT = 49812
+STEAMUI_INDEX = os.path.expanduser("~/.steam/steam/steamui/index.html")
+STEAMUI_SCRIPT = os.path.expanduser("~/.steam/steam/steamui/epic-integration.js")
+FRONTEND_SRC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "frontend",
+    "index.js",
 )
 
 
@@ -59,7 +72,6 @@ def get_free_games() -> dict:
                 continue
 
             offer = active_offers[0]["promotionalOffers"][0]
-            # discountPercentage == 0 in Epic's API means 0% of original price paid (100% off)
             discount = offer.get("discountSetting", {}).get("discountPercentage", 100)
             price_info = el.get("price", {}).get("totalPrice", {})
             if discount != 0 and price_info.get("discountPrice", -1) != 0:
@@ -205,9 +217,9 @@ def build_shortcuts_vdf(entries: list) -> bytes:
         out += _vdf_str("FlatpakAppID", "")
         out += b"\x00tags\x00"
         out += _vdf_str("0", "Epic Games")
-        out += b"\x08"  # end tags
-        out += b"\x08"  # end entry
-    out += b"\x08\x08"  # end shortcuts + root
+        out += b"\x08"
+        out += b"\x08"
+    out += b"\x08\x08"
     return bytes(out)
 
 
@@ -291,7 +303,11 @@ def start_auth(code: str = "") -> dict:
         )
         status = get_auth_status()
         if status["authenticated"]:
-            return {"ok": True, "authenticated": True, "displayName": status["displayName"]}
+            return {
+                "ok": True,
+                "authenticated": True,
+                "displayName": status["displayName"],
+            }
         return {
             "ok": False,
             "authenticated": False,
@@ -301,23 +317,110 @@ def start_auth(code: str = "") -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def ensure_steamui_injected() -> bool:
+    """Ensure frontend script is copied to steamui and referenced in index.html."""
+    try:
+        if os.path.isfile(FRONTEND_SRC):
+            shutil.copyfile(FRONTEND_SRC, STEAMUI_SCRIPT)
+        if not os.path.isfile(STEAMUI_INDEX):
+            return False
+        with open(STEAMUI_INDEX, "r", encoding="utf-8") as f:
+            html = f.read()
+        tag = '<script defer="defer" src="/epic-integration.js"></script>'
+        if "epic-integration.js" not in html and "</head>" in html:
+            html = html.replace("</head>", tag + "</head>")
+            with open(STEAMUI_INDEX, "w", encoding="utf-8") as f:
+                f.write(html)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def dispatch_method(method: str, arg: str = "") -> dict:
+    if method in ("free", "GetFreeGames"):
+        return get_free_games()
+    if method in ("library", "GetEpicLibrary"):
+        return get_epic_library()
+    if method in ("sync", "SyncSteamShortcuts"):
+        return sync_to_steam_shortcuts()
+    if method in ("launch", "LaunchOrInstallEpicGame"):
+        return launch_or_install_game(arg)
+    if method in ("auth", "AuthenticateEpic"):
+        return start_auth(arg)
+    return {"ok": False, "error": f"Unknown method: {method}"}
+
+
+class EpicRPCHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def _send_json(self, payload: dict, status: int = 200):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self._send_json({"ok": True})
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        method = parsed.path.lstrip("/") or "GetFreeGames"
+        arg = (qs.get("arg") or qs.get("app_name") or qs.get("auth_code") or [""])[0]
+        self._send_json(dispatch_method(method, arg))
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {}
+        method = body.get("method") or self.path.lstrip("/")
+        args = body.get("args") or {}
+        arg = ""
+        if isinstance(args, dict):
+            arg = args.get("app_name") or args.get("auth_code") or ""
+        elif isinstance(args, str):
+            arg = args
+        self._send_json(dispatch_method(method, arg))
+
+
+def run_daemon():
+    ensure_steamui_injected()
+
+    def watcher():
+        while True:
+            ensure_steamui_injected()
+            time.sleep(10)
+
+    t = threading.Thread(target=watcher, daemon=True)
+    t.start()
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", DAEMON_PORT), EpicRPCHandler)
+    server.serve_forever()
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "free"
     arg = sys.argv[2] if len(sys.argv) > 2 else ""
 
-    if cmd == "free":
-        res = get_free_games()
-    elif cmd == "library":
-        res = get_epic_library()
-    elif cmd == "sync":
-        res = sync_to_steam_shortcuts()
-    elif cmd == "launch":
-        res = launch_or_install_game(arg)
-    elif cmd == "auth":
-        res = start_auth(arg)
-    else:
-        res = {"ok": False, "error": f"Unknown command: {cmd}"}
+    if cmd == "serve":
+        run_daemon()
+        return
+    if cmd == "inject":
+        changed = ensure_steamui_injected()
+        print(json.dumps({"ok": True, "injected": changed}))
+        return
 
+    res = dispatch_method(cmd, arg)
     print(json.dumps(res, ensure_ascii=False))
 
 

@@ -1,24 +1,34 @@
 /**
- * Steam Epic Integration — Millennium Frontend
+ * Steam Epic Integration — Frontend
  * Subtle, native-Steam-styled integration for claiming Epic free games
  * and launching/syncing Epic library via Legendary without Epic Games Launcher.
+ * Supports both Millennium IPC and direct localhost bridge (127.0.0.1:49812).
  */
 
 const PLUGIN_NAME = "steam-epic-integration";
+const LOCAL_DAEMON_URL = "http://127.0.0.1:49812";
 
 async function callBackend(method, args = {}) {
-    if (!window.Millennium || typeof window.Millennium.callServerMethod !== "function") {
-        throw new Error("Millennium API není dostupné.");
+    if (window.Millennium && typeof window.Millennium.callServerMethod === "function") {
+        try {
+            const raw = await window.Millennium.callServerMethod(PLUGIN_NAME, method, args);
+            let parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+            if (parsed && typeof parsed.value === "string") {
+                parsed = JSON.parse(parsed.value);
+            } else if (typeof parsed === "string") {
+                parsed = JSON.parse(parsed);
+            }
+            return parsed;
+        } catch (_) {
+            // Fall through to local daemon bridge
+        }
     }
-    const raw = await window.Millennium.callServerMethod(PLUGIN_NAME, method, args);
-    let parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-    // Unwrap if Millennium returns { value: "..." } or nested JSON string
-    if (parsed && typeof parsed.value === "string") {
-        parsed = JSON.parse(parsed.value);
-    } else if (typeof parsed === "string") {
-        parsed = JSON.parse(parsed);
-    }
-    return parsed;
+    const resp = await fetch(`${LOCAL_DAEMON_URL}/${method}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ method, args }),
+    });
+    return await resp.json();
 }
 
 const STEAM_NATIVE_CSS = `
@@ -57,7 +67,7 @@ const STEAM_NATIVE_CSS = `
 .se-popover {
     position: fixed;
     top: 34px;
-    right: 110px;
+    right: 220px;
     width: 340px;
     max-height: 460px;
     background: #171d25;
@@ -195,7 +205,7 @@ function openInSteamBrowser(url) {
 
 function injectIntoWindow(win) {
     const doc = win.document;
-    if (!doc || doc.querySelector(".se-top-btn")) return;
+    if (!doc || !doc.body || doc.querySelector(".se-top-btn")) return;
 
     if (!doc.getElementById("se-steam-styles")) {
         const style = doc.createElement("style");
@@ -376,21 +386,19 @@ function injectIntoWindow(win) {
 
     btn.onclick = togglePopover;
 
-    // Place subtly next to Steam's top-right notification/account controls
+    // Place right next to the top-right notification bell / megaphone buttons in Steam
     const targetBar =
-        doc.querySelector('[class*=" SuperNavBar"]') ||
         doc.querySelector('[class*="TitleBarControls"]') ||
         doc.querySelector('[class*="titlearea"]') ||
         doc.body;
 
     if (targetBar === doc.body) {
-        btn.style.cssText = "position:fixed;top:6px;right:130px;z-index:99998;";
+        btn.style.cssText = "position:fixed;top:6px;right:330px;z-index:99998;";
         doc.body.appendChild(btn);
     } else {
-        targetBar.appendChild(btn);
+        targetBar.insertBefore(btn, targetBar.firstChild);
     }
 
-    // Background check for free games to light up subtle blue indicator dot
     callBackend("GetFreeGames")
         .then((res) => {
             cachedFree = res;
@@ -402,27 +410,18 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.Millennium?.AddWindowCreateHook) {
-        window.Millennium.AddWindowCreateHook((popup) => {
-            try {
-                const win = popup?.m_strName?.startsWith("SP Desktop_") ? popup.m_wnd : null;
-                if (win) setTimeout(() => injectIntoWindow(win), 1200);
-            } catch (_) {}
-        });
-    }
     setInterval(() => {
         try {
-            if (typeof g_PopupManager !== "undefined") {
+            if (typeof g_PopupManager !== "undefined" && g_PopupManager.GetPopups) {
                 Array.from(g_PopupManager.GetPopups()).forEach((p) => {
-                    if (p?.m_wnd?.document && p.m_strName?.startsWith("SP Desktop_")) {
-                        injectIntoWindow(p.m_wnd);
+                    const w = p?.m_wnd || p?.window;
+                    if (w?.document?.body && w.document.title !== "SharedJSContext") {
+                        injectIntoWindow(w);
                     }
                 });
-            } else if (document?.body) {
-                injectIntoWindow(window);
             }
         } catch (_) {}
-    }, 2500);
+    }, 1500);
 }
 
 initPlugin();
