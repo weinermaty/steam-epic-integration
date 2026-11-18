@@ -477,25 +477,45 @@ def start_auth(code: str = "") -> dict:
 def open_claim_window(target_url: str) -> dict:
     """
     Opens a compact checkout window pre-authenticated with the user's Legendary session!
-    1. Generates a fresh 1-time exchangeCode from LegendaryCore in the background.
-    2. Opens WebKit2 on https://www.epicgames.com/id/api/csrf, exchanges the token via
-       fetch('/id/api/exchange') so the browser receives authenticated Epic cookies
-       automatically (zero re-login!), and redirects straight to the direct purchase
-       checkout modal (`https://www.epicgames.com/store/purchase?...`).
+    1. Automatically accepts any pending Epic Store EULAs in the background via Epic's API.
+    2. Sets the `EPIC_BEARER_TOKEN` cookie on `.epicgames.com` using Legendary's access_token
+       and loads `store.epicgames.com/en-US/cart` so Epic's storefront mints the `EPIC_EG1`
+       store session cookie (preventing the '400 Account id is missing' error on checkout).
+    3. Automatically redirects straight to the direct purchase modal (`https://www.epicgames.com/store/purchase?...`).
     """
     if not target_url or "epicgames.com" not in target_url:
         return {"ok": False, "error": "Invalid store URL"}
 
+    access_token = ""
     exchange_code = ""
+    account_id = ""
     try:
         from legendary.core import LegendaryCore
 
         core = LegendaryCore()
         if core.login():
+            access_token = core.lgd.userdata.get("access_token", "")
+            account_id = core.lgd.userdata.get("account_id", "")
             tok = core.egs.get_game_token()
             exchange_code = tok.get("code", "") if isinstance(tok, dict) else ""
+
+            # Auto-accept required Epic Store EULAs in the background if needed
+            if access_token and account_id:
+                for eula_key in ("epicgames_privacy_policy_no_table", "egstore"):
+                    try:
+                        eula_url = f"https://eulatracking-public-service-prod-m.ol.epicgames.com/eulatracking/api/public/agreements/{eula_key}/account/{account_id}"
+                        r = core.egs.session.get(eula_url, timeout=5)
+                        if r.status_code == 200 and r.text:
+                            edata = r.json()
+                            if edata and "version" in edata:
+                                ver = edata["version"]
+                                loc = edata.get("locale", "en-US")
+                                acc_url = f"https://eulatracking-public-service-prod-m.ol.epicgames.com/eulatracking/api/public/agreements/{eula_key}/version/{ver}/account/{account_id}/accept?locale={loc}"
+                                core.egs.session.post(acc_url, timeout=5)
+                    except Exception:
+                        pass
     except Exception:
-        exchange_code = ""
+        pass
 
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":0")
@@ -506,52 +526,64 @@ def open_claim_window(target_url: str) -> dict:
 import json, sys, webview
 
 target_url = sys.argv[1]
-exchange_code = sys.argv[2]
-storage_dir = sys.argv[3]
+access_token = sys.argv[2]
+exchange_code = sys.argv[3]
+storage_dir = sys.argv[4]
 
-boot_url = "https://www.epicgames.com/account/personal" if exchange_code else target_url
-win = webview.create_window("Epic Games — Potvrzení objednávky (0 Kč)", boot_url, width=540, height=720)
-state = {"done": False}
+boot_url = "https://store.epicgames.com/en-US/cart" if access_token else target_url
+win = webview.create_window("Epic Games — Potvrzení objednávky (0 Kč)", boot_url, width=560, height=740)
+state = {"stage": 0}
 
 def on_loaded():
-    if state["done"] or not exchange_code:
+    if not access_token:
         return
-    state["done"] = True
-    js = f'''
-    (async function() {{
-        try {{
-            await fetch("https://www.epicgames.com/id/api/csrf", {{ credentials: "include" }});
-            const m = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
-            const xsrf = m ? decodeURIComponent(m[1]) : "";
-            await fetch("https://www.epicgames.com/id/api/exchange", {{
-                method: "POST",
-                credentials: "include",
-                headers: {{
-                    "Content-Type": "application/json",
-                    "X-XSRF-TOKEN": xsrf
-                }},
-                body: JSON.stringify({{ exchangeCode: {json.dumps(exchange_code)} }})
-            }});
-        }} catch (e) {{}}
-        window.location.replace({json.dumps(target_url)});
-    }})();
-    '''
-    try:
-        win.evaluate_js(js)
-    except Exception:
-        pass
+    if state["stage"] == 0:
+        state["stage"] = 1
+        # Inject EPIC_BEARER_TOKEN cookie on .epicgames.com and reload cart so store.epicgames.com mints EPIC_EG1
+        js_stage1 = f'''
+        (async function() {{
+            document.cookie = "EPIC_BEARER_TOKEN=" + {json.dumps(access_token)} + "; domain=.epicgames.com; path=/; secure; SameSite=Lax";
+            try {{
+                await fetch("https://www.epicgames.com/id/api/csrf", {{ credentials: "include" }});
+                const m = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+                const xsrf = m ? decodeURIComponent(m[1]) : "";
+                if ({json.dumps(exchange_code)}) {{
+                    await fetch("https://www.epicgames.com/id/api/exchange", {{
+                        method: "POST",
+                        credentials: "include",
+                        headers: {{ "Content-Type": "application/json", "X-XSRF-TOKEN": xsrf }},
+                        body: JSON.stringify({{ exchangeCode: {json.dumps(exchange_code)} }})
+                    }});
+                }}
+                await fetch("https://www.epicgames.com/id/api/authenticate", {{ credentials: "include" }});
+            }} catch (e) {{}}
+            window.location.replace("https://www.epicgames.com/id/login?noHostRedirect=true&client_id=875a3b57d3a640a6b7f9b4e883463ab4&redirectUrl=" + encodeURIComponent({json.dumps(target_url)}));
+        }})();
+        '''
+        try:
+            win.evaluate_js(js_stage1)
+        except Exception:
+            pass
 
 win.events.loaded += on_loaded
 webview.start(private_mode=False, storage_path=storage_dir)
 """
     subprocess.Popen(
-        [sys.executable, "-c", py_script, target_url, exchange_code, storage_dir],
+        [
+            sys.executable,
+            "-c",
+            py_script,
+            target_url,
+            access_token,
+            exchange_code,
+            storage_dir,
+        ],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    return {"ok": True, "url": target_url, "autoLoggedIn": bool(exchange_code)}
+    return {"ok": True, "url": target_url, "autoLoggedIn": bool(access_token)}
 
 
 def ensure_steamui_injected() -> bool:
