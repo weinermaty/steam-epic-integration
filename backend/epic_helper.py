@@ -53,7 +53,11 @@ _LAST_CLAIM_COMPLETED_TS = 0.0
 
 # Active & completed Epic downloads/updates tracked for Steam's Downloads page
 _ACTIVE_DOWNLOADS = {}  # appName -> {appName, title, status, progress, speed, eta, updatedAt}
+_ACTIVE_DOWNLOAD_PROCS = {}  # appName -> subprocess.Popen
+_TRANSFER_CONTROL = {}  # appName -> "paused" | "cancelled"
 _DOWNLOADS_LOCK = threading.Lock()
+PLAYTIME_FILE = os.path.expanduser("~/.local/share/steam-epic-integration/playtime.json")
+GAME_SIZE_CACHE_FILE = os.path.expanduser("~/.cache/steam-epic-integration/game_sizes.json")
 
 
 def find_legendary() -> str:
@@ -370,18 +374,42 @@ def _build_launch_cmd(leg: str, app_name: str, platform: str = "") -> tuple[list
     return [leg, "launch", "--no-wine", "--wrapper", f'"{proton_path}" run', app_name], env
 
 
+def _record_playtime_proc(proc: subprocess.Popen, app_name: str):
+    start_ts = time.time()
+    try:
+        proc.wait()
+    except Exception:
+        return
+    elapsed = max(0, int(time.time() - start_ts))
+    if elapsed < 2:
+        return
+    try:
+        os.makedirs(os.path.dirname(PLAYTIME_FILE), exist_ok=True)
+        data = {}
+        if os.path.isfile(PLAYTIME_FILE):
+            with open(PLAYTIME_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data[app_name] = int(data.get(app_name, 0)) + elapsed
+        with open(PLAYTIME_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def _run_legendary_transfer(app_name: str, title: str, mode: str = "update", auto_launch: bool = False):
     leg = find_legendary()
     with _DOWNLOADS_LOCK:
         existing = _ACTIVE_DOWNLOADS.get(app_name)
         if existing and existing.get("status") == "downloading":
             return
+        prev_progress = existing.get("progress", 0.0) if existing else 0.0
+        _TRANSFER_CONTROL.pop(app_name, None)
         _ACTIVE_DOWNLOADS[app_name] = {
             "appName": app_name,
             "title": title or app_name,
             "mode": mode,
             "status": "downloading",
-            "progress": 0.0,
+            "progress": prev_progress,
             "speed": "",
             "eta": "",
             "updatedAt": time.time(),
@@ -402,6 +430,8 @@ def _run_legendary_transfer(app_name: str, title: str, mode: str = "update", aut
             text=True,
             bufsize=1,
         )
+        with _DOWNLOADS_LOCK:
+            _ACTIVE_DOWNLOAD_PROCS[app_name] = proc
         pct_re = re.compile(r"Progress:\s*([0-9.]+)%")
         speed_re = re.compile(r"Download\s*-\s*([0-9.]+\s*[KMG]i?B/s)")
         eta_re = re.compile(r"ETA:\s*([0-9:]+)")
@@ -425,25 +455,160 @@ def _run_legendary_transfer(app_name: str, title: str, mode: str = "update", aut
         ok = proc.returncode == 0
     except Exception:
         ok = False
+    finally:
+        with _DOWNLOADS_LOCK:
+            _ACTIVE_DOWNLOAD_PROCS.pop(app_name, None)
 
     with _DOWNLOADS_LOCK:
+        ctrl = _TRANSFER_CONTROL.pop(app_name, None)
+        if ctrl == "cancelled":
+            _ACTIVE_DOWNLOADS.pop(app_name, None)
+            return
         entry = _ACTIVE_DOWNLOADS.get(app_name)
         if entry:
-            entry["status"] = "completed" if ok else "failed"
-            entry["progress"] = 100.0 if ok else entry["progress"]
+            if ctrl == "paused":
+                entry["status"] = "paused"
+            else:
+                entry["status"] = "completed" if ok else "failed"
+                entry["progress"] = 100.0 if ok else entry["progress"]
             entry["speed"] = ""
             entry["eta"] = ""
             entry["updatedAt"] = time.time()
 
-    if ok and auto_launch:
+    if ok and auto_launch and ctrl is None:
         launch_cmd, launch_env = _build_launch_cmd(leg, app_name)
-        subprocess.Popen(
+        lproc = subprocess.Popen(
             launch_cmd,
             env=launch_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        threading.Thread(target=_record_playtime_proc, args=(lproc, app_name), daemon=True).start()
+
+
+def pause_epic_download(app_name: str) -> dict:
+    with _DOWNLOADS_LOCK:
+        proc = _ACTIVE_DOWNLOAD_PROCS.get(app_name)
+        entry = _ACTIVE_DOWNLOADS.get(app_name)
+        if not entry:
+            return {"ok": False, "error": "No active transfer"}
+        _TRANSFER_CONTROL[app_name] = "paused"
+        entry["status"] = "paused"
+        entry["speed"] = ""
+        entry["eta"] = ""
+        entry["updatedAt"] = time.time()
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    return {"ok": True, "status": "paused", "appName": app_name}
+
+
+def resume_epic_download(app_name: str, title: str = "") -> dict:
+    with _DOWNLOADS_LOCK:
+        entry = _ACTIVE_DOWNLOADS.get(app_name)
+        mode = entry.get("mode", "install") if entry else "install"
+        game_title = title or (entry.get("title", app_name) if entry else app_name)
+    threading.Thread(
+        target=_run_legendary_transfer,
+        args=(app_name, game_title, mode, False),
+        daemon=True,
+    ).start()
+    return {"ok": True, "status": "downloading", "appName": app_name}
+
+
+def cancel_epic_download(app_name: str) -> dict:
+    with _DOWNLOADS_LOCK:
+        proc = _ACTIVE_DOWNLOAD_PROCS.get(app_name)
+        _TRANSFER_CONTROL[app_name] = "cancelled"
+        _ACTIVE_DOWNLOADS.pop(app_name, None)
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    return {"ok": True, "status": "cancelled", "appName": app_name}
+
+
+def uninstall_epic_game(app_name: str) -> dict:
+    if not app_name or not all(c.isalnum() or c in "-_." for c in app_name):
+        return {"ok": False, "error": "Invalid app_name"}
+    leg = find_legendary()
+    try:
+        res = subprocess.run([leg, "uninstall", "-y", app_name], capture_output=True, text=True, timeout=30)
+        with _DOWNLOADS_LOCK:
+            _ACTIVE_DOWNLOADS.pop(app_name, None)
+        return {"ok": res.returncode == 0, "appName": app_name}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def get_epic_game_info(app_name: str) -> dict:
+    if not app_name or not all(c.isalnum() or c in "-_." for c in app_name):
+        return {"ok": False, "error": "Invalid app_name"}
+
+    disk_size = 0
+    download_size = 0
+    installed = False
+    installed_json = os.path.expanduser("~/.config/legendary/installed.json")
+    if os.path.isfile(installed_json):
+        try:
+            with open(installed_json, "r", encoding="utf-8") as f:
+                inst = json.load(f).get(app_name)
+            if inst:
+                installed = True
+                disk_size = int(inst.get("install_size") or 0)
+        except Exception:
+            pass
+
+    if disk_size == 0:
+        cache = {}
+        try:
+            if os.path.isfile(GAME_SIZE_CACHE_FILE):
+                with open(GAME_SIZE_CACHE_FILE, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+        except Exception:
+            cache = {}
+
+        if app_name in cache:
+            disk_size = int(cache[app_name].get("diskSize") or 0)
+            download_size = int(cache[app_name].get("downloadSize") or 0)
+        else:
+            leg = find_legendary()
+            try:
+                res = subprocess.run([leg, "info", app_name, "--json"], capture_output=True, text=True, timeout=6)
+                if res.returncode == 0 and res.stdout.strip():
+                    info = json.loads(res.stdout)
+                    manifest = info.get("manifest") or {}
+                    inst_info = info.get("install") or {}
+                    disk_size = int(manifest.get("disk_size") or inst_info.get("disk_size") or 0)
+                    download_size = int(manifest.get("download_size") or 0)
+                    if disk_size > 0:
+                        os.makedirs(os.path.dirname(GAME_SIZE_CACHE_FILE), exist_ok=True)
+                        cache[app_name] = {"diskSize": disk_size, "downloadSize": download_size}
+                        with open(GAME_SIZE_CACHE_FILE, "w", encoding="utf-8") as f:
+                            json.dump(cache, f)
+            except Exception:
+                pass
+
+    playtime_seconds = 0
+    try:
+        if os.path.isfile(PLAYTIME_FILE):
+            with open(PLAYTIME_FILE, "r", encoding="utf-8") as f:
+                playtime_seconds = int(json.load(f).get(app_name, 0))
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "appName": app_name,
+        "installed": installed,
+        "diskSize": disk_size,
+        "downloadSize": download_size,
+        "playtimeSeconds": playtime_seconds,
+    }
 
 
 def _download_artwork_bytes(app_name: str, kind: str, url: str) -> bytes:
@@ -701,7 +866,9 @@ def launch_or_install_game(app_name: str, title: str = "", blocking: bool = Fals
             start_new_session=True,
         )
         if blocking:
-            proc.wait()
+            _record_playtime_proc(proc, app_name)
+        else:
+            threading.Thread(target=_record_playtime_proc, args=(proc, app_name), daemon=True).start()
         return {"ok": True, "action": "launched", "appName": app_name}
     else:
         if not title:
@@ -1128,6 +1295,16 @@ def dispatch_method(method: str, arg: str = "", extra: dict = None) -> dict:
         return sync_to_steam_shortcuts()
     if method in ("launch", "LaunchOrInstallEpicGame"):
         return launch_or_install_game(arg, extra.get("title", ""))
+    if method == "PauseEpicDownload":
+        return pause_epic_download(arg)
+    if method == "ResumeEpicDownload":
+        return resume_epic_download(arg, extra.get("title", ""))
+    if method == "CancelEpicDownload":
+        return cancel_epic_download(arg)
+    if method == "UninstallEpicGame":
+        return uninstall_epic_game(arg)
+    if method == "GetEpicGameInfo":
+        return get_epic_game_info(arg)
     if method in ("auth", "AuthenticateEpic"):
         return start_auth(arg)
     if method in ("claim", "OpenClaimWindow"):

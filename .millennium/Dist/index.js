@@ -169,6 +169,82 @@ const STEAM_BUTTON_CSS = `
     background: #1a9fff;
     transition: width 0.3s ease;
 }
+.se-dl-bar.se-paused {
+    background: #59616d;
+}
+.se-dl-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+.se-dl-section .se-btn,
+.se-game-info-strip .se-btn {
+    background: #2b3340;
+    color: #dfe3e6;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 2px;
+    padding: 6px 12px;
+    font-family: "Motiva Sans", Arial, Helvetica, sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+.se-dl-section .se-btn:hover,
+.se-game-info-strip .se-btn:hover {
+    background: #3a4454;
+    color: #ffffff;
+}
+.se-dl-section .se-btn-primary,
+.se-game-info-strip .se-btn-primary {
+    background: #1a9fff;
+    color: #ffffff;
+    border-color: transparent;
+}
+.se-dl-section .se-btn-primary:hover,
+.se-game-info-strip .se-btn-primary:hover {
+    background: #33adff;
+}
+.se-dl-section .se-btn-icon,
+.se-game-info-strip .se-btn-icon {
+    width: 32px;
+    height: 30px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+}
+.se-game-info-strip {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 24px;
+    padding: 12px 16px;
+    margin: 8px 0 12px 0;
+    background: rgba(23, 29, 37, 0.72);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 2px;
+    font-family: "Motiva Sans", Arial, Helvetica, sans-serif;
+}
+.se-game-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.se-game-stat-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+    color: #8b929a;
+}
+.se-game-stat-val {
+    font-size: 13px;
+    font-weight: 500;
+    color: #dcdedf;
+}
 .se-epic-install-btn,
 body[data-se-epic-uninstalled="1"] [class*="PlayButtonContainer"],
 body[data-se-epic-uninstalled="1"] [class*="PlayButton"] {
@@ -814,7 +890,7 @@ async function injectEpicDownloadsSection(doc) {
         const barWrap = doc.createElement("div");
         barWrap.className = "se-dl-bar-wrap";
         const bar = doc.createElement("div");
-        bar.className = "se-dl-bar";
+        bar.className = `se-dl-bar ${trItem.status === "paused" ? "se-paused" : ""}`;
         bar.style.width = `${Math.min(100, Math.round(trItem.progress || 0))}%`;
         barWrap.appendChild(bar);
 
@@ -823,12 +899,67 @@ async function injectEpicDownloadsSection(doc) {
         infoEl.textContent =
             trItem.status === "completed"
                 ? tr("Dokončeno • 100%", "Completed • 100%")
+                : trItem.status === "paused"
+                ? tr(`Pozastaveno • ${Math.round(trItem.progress || 0)}%`, `Paused • ${Math.round(trItem.progress || 0)}%`)
                 : trItem.status === "failed"
                 ? tr("Chyba stahování", "Download failed")
                 : `${Math.round(trItem.progress || 0)}% ${trItem.speed ? "• " + trItem.speed : ""} ${trItem.eta ? "• " + trItem.eta : ""}`;
 
         main.append(nameRow, barWrap, infoEl);
-        row.appendChild(main);
+
+        const actions = doc.createElement("div");
+        actions.className = "se-dl-actions";
+        if (trItem.status === "downloading") {
+            const pauseBtn = doc.createElement("button");
+            pauseBtn.className = "se-btn se-btn-primary se-btn-icon";
+            pauseBtn.title = tr("Pozastavit", "Pause");
+            pauseBtn.textContent = "❚❚";
+            pauseBtn.onclick = async () => {
+                await callBackend("PauseEpicDownload", { app_name: trItem.appName });
+                lastDownloadsCheckTs = 0;
+                refreshUpdatesCacheAsync(doc);
+            };
+            const cancelBtn = doc.createElement("button");
+            cancelBtn.className = "se-btn se-btn-icon";
+            cancelBtn.title = tr("Zrušit", "Cancel");
+            cancelBtn.textContent = "✕";
+            cancelBtn.onclick = async () => {
+                await callBackend("CancelEpicDownload", { app_name: trItem.appName });
+                lastDownloadsCheckTs = 0;
+                refreshUpdatesCacheAsync(doc);
+            };
+            actions.append(pauseBtn, cancelBtn);
+        } else if (trItem.status === "paused" || trItem.status === "failed") {
+            const resBtn = doc.createElement("button");
+            resBtn.className = "se-btn se-btn-primary se-btn-icon";
+            resBtn.title = tr("Pokračovat", "Resume");
+            resBtn.textContent = "▶";
+            resBtn.onclick = async () => {
+                await callBackend("ResumeEpicDownload", { app_name: trItem.appName, title: trItem.title });
+                lastDownloadsCheckTs = 0;
+                refreshUpdatesCacheAsync(doc);
+            };
+            const cancelBtn = doc.createElement("button");
+            cancelBtn.className = "se-btn se-btn-icon";
+            cancelBtn.title = tr("Zrušit", "Cancel");
+            cancelBtn.textContent = "✕";
+            cancelBtn.onclick = async () => {
+                await callBackend("CancelEpicDownload", { app_name: trItem.appName });
+                lastDownloadsCheckTs = 0;
+                refreshUpdatesCacheAsync(doc);
+            };
+            actions.append(resBtn, cancelBtn);
+        } else if (trItem.status === "completed") {
+            const playBtn = doc.createElement("button");
+            playBtn.className = "se-btn se-btn-primary";
+            playBtn.textContent = tr("Hrát", "Play");
+            playBtn.onclick = () => {
+                callBackend("LaunchOrInstallEpicGame", { app_name: trItem.appName, title: trItem.title });
+            };
+            actions.appendChild(playBtn);
+        }
+
+        row.append(main, actions);
         container.appendChild(row);
     }
 
@@ -963,6 +1094,57 @@ function syncSidebarEpicRows(doc) {
     }
 }
 
+const epicTitleToAppName = new Map();
+let epicTitleMapLoaded = false;
+const epicGameInfoCache = new Map();
+const epicGameInfoPending = new Set();
+
+function ensureEpicTitleMap(doc) {
+    if (epicTitleMapLoaded) return;
+    epicTitleMapLoaded = true;
+    callBackend("GetEpicLibrary", { forceRefresh: false })
+        .then((res) => {
+            for (const g of res?.games || []) {
+                if (g.title && g.appName) epicTitleToAppName.set(g.title, g.appName);
+            }
+            if (doc) updateEpicGameDetailsStatus(doc);
+        })
+        .catch(() => {
+            epicTitleMapLoaded = false;
+        });
+}
+
+function requestEpicGameInfo(appName, doc) {
+    if (!appName || epicGameInfoCache.has(appName) || epicGameInfoPending.has(appName)) return;
+    epicGameInfoPending.add(appName);
+    callBackend("GetEpicGameInfo", { app_name: appName })
+        .then((res) => {
+            if (res?.ok) {
+                epicGameInfoCache.set(appName, res);
+                if (doc) updateEpicGameDetailsStatus(doc);
+            }
+        })
+        .catch(() => {})
+        .finally(() => epicGameInfoPending.delete(appName));
+}
+
+function formatBytes(bytes) {
+    if (!bytes || bytes <= 0) return "—";
+    const gb = bytes / (1024 * 1024 * 1024);
+    if (gb >= 1) return `${gb.toFixed(2)} GB`;
+    const mb = bytes / (1024 * 1024);
+    return `${Math.round(mb)} MB`;
+}
+
+function formatPlaytime(sec) {
+    const s = Number(sec || 0);
+    if (s < 60) return tr("0 minut", "0 minutes");
+    const mins = Math.round(s / 60);
+    if (mins < 60) return tr(`${mins} min`, `${mins} minutes`);
+    const hrs = (s / 3600).toFixed(1);
+    return tr(`${hrs} hod.`, `${hrs} hours`);
+}
+
 function updateEpicGameDetailsStatus(doc) {
     if (!doc || doc.title !== "Steam" || !doc.body) return;
 
@@ -986,12 +1168,14 @@ function updateEpicGameDetailsStatus(doc) {
 
     refreshUpdatesCacheAsync(doc);
     syncSidebarEpicRows(doc);
+    ensureEpicTitleMap(doc);
 
     const histPath = window.MainWindowBrowserManager?.m_history?.location?.pathname || "";
     const m = histPath.match(/\/library\/app\/(\d+)/);
     const selectedAppId = m ? Number(m[1]) : window.uiStore?.currentGameListSelection?.nAppId;
     if (!selectedAppId) {
         delete doc.body.dataset.seEpicUninstalled;
+        doc.querySelectorAll(".se-game-info-strip").forEach((el) => el.remove());
         return;
     }
 
@@ -1001,6 +1185,7 @@ function updateEpicGameDetailsStatus(doc) {
 
     if (!displayName.endsWith(" (Epic)")) {
         delete doc.body.dataset.seEpicUninstalled;
+        doc.querySelectorAll(".se-game-info-strip").forEach((el) => el.remove());
         for (const container of containers) {
             if (container.dataset.seEpicInstallBtn === "1") {
                 const playBtn = container.querySelector('[class*="PlayButton"]') || container;
@@ -1021,11 +1206,17 @@ function updateEpicGameDetailsStatus(doc) {
     }
 
     const baseTitle = displayName.slice(0, -7);
+    const appName = epicTitleToAppName.get(baseTitle) || "";
+    if (appName) requestEpicGameInfo(appName, doc);
+    const gameInfo = appName ? epicGameInfoCache.get(appName) : null;
+
     const installed = (cachedUpdatesData?.installedGames || []).some(
         (g) => g.title === baseTitle || `${g.title} (Epic)` === displayName
     );
     const activeTransfer = (cachedUpdatesData?.activeTransfers || []).find(
-        (t) => (t.title === baseTitle || `${t.title} (Epic)` === displayName) && t.status === "downloading"
+        (t) =>
+            (t.title === baseTitle || `${t.title} (Epic)` === displayName) &&
+            (t.status === "downloading" || t.status === "paused")
     );
 
     if (!installed || activeTransfer) {
@@ -1034,19 +1225,18 @@ function updateEpicGameDetailsStatus(doc) {
         delete doc.body.dataset.seEpicUninstalled;
     }
 
-    if (containers.length === 0) return;
-
+    // Update Play/Install button label
     for (const container of containers) {
         const playBtn = container.querySelector('[class*="PlayButton"]') || container;
         const btnTextEl = container.querySelector('[class*="ButtonText"]') || playBtn;
 
         if (!installed || activeTransfer) {
-            const targetLabel = activeTransfer
-                ? tr(
-                      `Stahuje se ${Math.round(activeTransfer.progress || 0)}%`,
-                      `Downloading ${Math.round(activeTransfer.progress || 0)}%`
-                  )
-                : tr("Nainstalovat", "Install");
+            const targetLabel =
+                activeTransfer?.status === "paused"
+                    ? tr(`Pozastaveno ${Math.round(activeTransfer.progress || 0)}%`, `Paused ${Math.round(activeTransfer.progress || 0)}%`)
+                    : activeTransfer?.status === "downloading"
+                    ? tr(`Stahuje se ${Math.round(activeTransfer.progress || 0)}%`, `Downloading ${Math.round(activeTransfer.progress || 0)}%`)
+                    : tr("Nainstalovat", "Install");
             if (btnTextEl) {
                 if (!container.dataset.seOrigText) {
                     container.dataset.seOrigText = btnTextEl.textContent || "Play";
@@ -1073,6 +1263,113 @@ function updateEpicGameDetailsStatus(doc) {
             container.classList.remove("se-epic-install-btn");
             playBtn.classList.remove("se-epic-install-btn");
             delete container.dataset.seEpicInstallBtn;
+        }
+    }
+
+    // Replace ugly dashed Non-Steam notice box with native Steam metadata & controls strip
+    let noticeBox = null;
+    for (const el of doc.querySelectorAll("div")) {
+        if (el.children.length > 2) continue;
+        const t = el.textContent || "";
+        if (t.includes("is unavailable because it is a non-Steam game") || t.includes("nejsou k dispozici, protože")) {
+            const r = el.getBoundingClientRect();
+            if (r.left > 200 && r.width > 200) {
+                noticeBox = el;
+                break;
+            }
+        }
+    }
+    if (noticeBox) {
+        noticeBox.style.display = "none";
+        let strip = noticeBox.parentElement?.querySelector(".se-game-info-strip");
+        const stripKey = JSON.stringify({
+            appName,
+            installed,
+            diskSize: gameInfo?.diskSize || 0,
+            pt: gameInfo?.playtimeSeconds || 0,
+            st: activeTransfer?.status || "",
+            pct: Math.round(activeTransfer?.progress || 0),
+        });
+        if (!strip) {
+            strip = doc.createElement("div");
+            strip.className = "se-game-info-strip";
+            noticeBox.insertAdjacentElement("afterend", strip);
+        }
+        if (strip.dataset.seStripKey !== stripKey) {
+            strip.dataset.seStripKey = stripKey;
+            strip.innerHTML = "";
+
+            const sizeStat = doc.createElement("div");
+            sizeStat.className = "se-game-stat";
+            const sizeLbl = doc.createElement("div");
+            sizeLbl.className = "se-game-stat-label";
+            sizeLbl.textContent = installed ? tr("Místo na disku", "Size on disk") : tr("Potřebné místo", "Space required");
+            const sizeVal = doc.createElement("div");
+            sizeVal.className = "se-game-stat-val";
+            sizeVal.textContent = formatBytes(gameInfo?.diskSize);
+            sizeStat.append(sizeLbl, sizeVal);
+
+            const ptStat = doc.createElement("div");
+            ptStat.className = "se-game-stat";
+            const ptLbl = doc.createElement("div");
+            ptLbl.className = "se-game-stat-label";
+            ptLbl.textContent = tr("Odehraný čas", "Play time");
+            const ptVal = doc.createElement("div");
+            ptVal.className = "se-game-stat-val";
+            ptVal.textContent = formatPlaytime(gameInfo?.playtimeSeconds);
+            ptStat.append(ptLbl, ptVal);
+
+            strip.append(sizeStat, ptStat);
+
+            if (appName && activeTransfer) {
+                const actWrap = doc.createElement("div");
+                actWrap.className = "se-dl-actions";
+                actWrap.style.marginLeft = "auto";
+                if (activeTransfer.status === "downloading") {
+                    const pBtn = doc.createElement("button");
+                    pBtn.className = "se-btn se-btn-primary";
+                    pBtn.textContent = tr("Pozastavit", "Pause");
+                    pBtn.onclick = async () => {
+                        await callBackend("PauseEpicDownload", { app_name: appName });
+                        lastDownloadsCheckTs = 0;
+                        refreshUpdatesCacheAsync(doc);
+                    };
+                    actWrap.appendChild(pBtn);
+                } else if (activeTransfer.status === "paused") {
+                    const rBtn = doc.createElement("button");
+                    rBtn.className = "se-btn se-btn-primary";
+                    rBtn.textContent = tr("Pokračovat", "Resume");
+                    rBtn.onclick = async () => {
+                        await callBackend("ResumeEpicDownload", { app_name: appName, title: baseTitle });
+                        lastDownloadsCheckTs = 0;
+                        refreshUpdatesCacheAsync(doc);
+                    };
+                    actWrap.appendChild(rBtn);
+                }
+                const cBtn = doc.createElement("button");
+                cBtn.className = "se-btn";
+                cBtn.textContent = tr("Zrušit", "Cancel");
+                cBtn.onclick = async () => {
+                    await callBackend("CancelEpicDownload", { app_name: appName });
+                    lastDownloadsCheckTs = 0;
+                    refreshUpdatesCacheAsync(doc);
+                };
+                actWrap.appendChild(cBtn);
+                strip.appendChild(actWrap);
+            } else if (appName && installed) {
+                const uBtn = doc.createElement("button");
+                uBtn.className = "se-btn";
+                uBtn.style.marginLeft = "auto";
+                uBtn.textContent = tr("Odinstalovat", "Uninstall");
+                uBtn.onclick = async () => {
+                    uBtn.textContent = tr("Odinstalovávám…", "Uninstalling…");
+                    await callBackend("UninstallEpicGame", { app_name: appName });
+                    epicGameInfoCache.delete(appName);
+                    lastDownloadsCheckTs = 0;
+                    refreshUpdatesCacheAsync(doc);
+                };
+                strip.appendChild(uBtn);
+            }
         }
     }
 }
@@ -1385,8 +1682,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 17) return;
-    window.__SE_EPIC_VERSION = 17;
+    if (window.__SE_EPIC_VERSION === 18) return;
+    window.__SE_EPIC_VERSION = 18;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
