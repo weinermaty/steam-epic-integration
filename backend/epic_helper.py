@@ -4,9 +4,9 @@ Backend helper & local daemon for steam-epic-integration.
 Handles:
 1. Fetching active Epic Games Store free games promotions.
 2. Reading Epic Games library & auth status via Legendary CLI.
-3. Syncing Epic Games directly into Steam's shortcuts.vdf (Non-Steam Games) so they launch via `legendary launch <app_name>` without Epic Games Launcher.
-4. Installing / Launching Epic games via Legendary CLI.
-5. Running as a lightweight localhost HTTP server (127.0.0.1:49812) + auto-patching Steam UI's index.html so the extension works on any Linux distro even when Millennium's binary requires newer GLIBC.
+3. Seamless 1-click Epic Games login via native WebKit2/pywebview window (no manual code copying).
+4. Syncing / unsyncing Epic Games in Steam's shortcuts.vdf + providing executable paths for live SteamClient.Apps.AddShortcut/RemoveShortcut.
+5. Installing / Launching Epic games via Legendary CLI (auto-installs if not yet installed when launched from Steam Library).
 """
 
 import binascii
@@ -132,8 +132,14 @@ def get_auth_status() -> dict:
 
 def get_epic_library() -> dict:
     auth = get_auth_status()
+    helper_path = os.path.abspath(__file__)
     if not auth["authenticated"]:
-        return {"ok": True, "authenticated": False, "games": []}
+        return {
+            "ok": True,
+            "authenticated": False,
+            "helperPath": helper_path,
+            "games": [],
+        }
 
     leg = find_legendary()
     installed_map = {}
@@ -154,7 +160,13 @@ def get_epic_library() -> dict:
         )
         items = json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout else []
     except Exception as exc:
-        return {"ok": False, "authenticated": True, "error": str(exc), "games": []}
+        return {
+            "ok": False,
+            "authenticated": True,
+            "helperPath": helper_path,
+            "error": str(exc),
+            "games": [],
+        }
 
     games = []
     for item in items:
@@ -175,6 +187,7 @@ def get_epic_library() -> dict:
         "ok": True,
         "authenticated": True,
         "displayName": auth["displayName"],
+        "helperPath": helper_path,
         "games": games,
     }
 
@@ -226,17 +239,17 @@ def build_shortcuts_vdf(entries: list) -> bytes:
 def sync_to_steam_shortcuts() -> dict:
     lib = get_epic_library()
     if not lib.get("authenticated"):
-        return {"ok": False, "error": "Nejprve se přihlas k Epic účtu přes Legendary."}
+        return {"ok": False, "error": "Nejprve se přihlas k Epic účtu."}
 
-    leg = find_legendary()
+    helper_path = os.path.abspath(__file__)
     games = lib.get("games", [])
     entries = []
     for g in games:
         entries.append(
             {
-                "AppName": g["title"],
-                "Exe": f'"{leg}"',
-                "StartDir": f'"{os.path.dirname(leg) or "/usr/bin"}"',
+                "AppName": f"{g['title']} (Epic)",
+                "Exe": f'"{helper_path}"',
+                "StartDir": f'"{os.path.dirname(helper_path)}"',
                 "LaunchOptions": f'launch {g["appName"]}',
             }
         )
@@ -247,7 +260,6 @@ def sync_to_steam_shortcuts() -> dict:
     written = []
     for cfg_dir in configs:
         vdf_path = os.path.join(cfg_dir, "shortcuts.vdf")
-        # shortcut: overwrites shortcuts.vdf with Epic library entries, upgrade to full binary VDF parser if merging pre-existing non-Epic shortcuts
         with open(vdf_path, "wb") as f:
             f.write(vdf_bytes)
         written.append(vdf_path)
@@ -278,8 +290,10 @@ def launch_or_install_game(app_name: str) -> dict:
         )
         return {"ok": True, "action": "launched", "appName": app_name}
     else:
+        # Install first, then automatically launch once download completes
+        cmd = f'"{leg}" install -y "{app_name}" && "{leg}" launch "{app_name}"'
         subprocess.Popen(
-            [leg, "install", "-y", app_name],
+            ["/bin/sh", "-c", cmd],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -289,11 +303,23 @@ def launch_or_install_game(app_name: str) -> dict:
 
 def start_auth(code: str = "") -> dict:
     leg = find_legendary()
+    if code == "logout":
+        subprocess.run([leg, "auth", "--delete"], capture_output=True, timeout=10)
+        return {"ok": True, "authenticated": False}
+
     if not code:
-        return {
-            "ok": True,
-            "loginUrl": "https://www.epicgames.com/id/login?redirectUrl=https%3A%2F%2Fwww.epicgames.com%2Fid%2Fapi%2Fredirect%3FclientId%3D34a02cf8f4414e29b15921876da36f9a%26responseType%3Dcode",
-        }
+        # Spawn interactive pywebview login window (user just logs in, no code copying needed)
+        env = os.environ.copy()
+        env.setdefault("DISPLAY", ":0")
+        subprocess.Popen(
+            [leg, "auth"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {"ok": True, "startedWebview": True}
+
     try:
         proc = subprocess.run(
             [leg, "auth", "--code", code.strip()],
@@ -318,7 +344,6 @@ def start_auth(code: str = "") -> dict:
 
 
 def ensure_steamui_injected() -> bool:
-    """Ensure frontend script is copied to steamui and referenced in index.html."""
     try:
         if os.path.isfile(FRONTEND_SRC):
             shutil.copyfile(FRONTEND_SRC, STEAMUI_SCRIPT)
@@ -340,6 +365,8 @@ def ensure_steamui_injected() -> bool:
 def dispatch_method(method: str, arg: str = "") -> dict:
     if method in ("free", "GetFreeGames"):
         return get_free_games()
+    if method in ("status", "GetAuthStatus"):
+        return get_auth_status()
     if method in ("library", "GetEpicLibrary"):
         return get_epic_library()
     if method in ("sync", "SyncSteamShortcuts"):

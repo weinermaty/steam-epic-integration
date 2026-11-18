@@ -1,12 +1,17 @@
 /**
  * Steam Epic Integration — Frontend
- * Subtle, native-Steam-styled integration for claiming Epic free games
- * and launching/syncing Epic library via Legendary without Epic Games Launcher.
- * Supports both Millennium IPC and direct localhost bridge (127.0.0.1:49812).
+ * Subtle, native-Steam-styled integration:
+ * 1. Placed cleanly to the left of the blue megaphone button (never overlaps the user's nickname).
+ * 2. 1-click Epic Games login window (automatically detects completion, no manual code copying).
+ * 3. Instant toggle switch ("Zobrazit Epic hry ve Steam Knihovně") that adds/removes all Epic games
+ *    live in Steam's sidebar via SteamClient.Apps.AddShortcut / RemoveShortcut without restarting Steam.
+ * 4. Free games claimer with embedded checkout popup.
  */
 
 const PLUGIN_NAME = "steam-epic-integration";
 const LOCAL_DAEMON_URL = "http://127.0.0.1:49812";
+const STORAGE_KEY_SYNC = "se_epic_library_enabled";
+const STORAGE_KEY_APPIDS = "se_epic_shortcut_appids";
 
 async function callBackend(method, args = {}) {
     if (window.Millennium && typeof window.Millennium.callServerMethod === "function") {
@@ -19,9 +24,7 @@ async function callBackend(method, args = {}) {
                 parsed = JSON.parse(parsed);
             }
             return parsed;
-        } catch (_) {
-            // Fall through to local daemon bridge
-        }
+        } catch (_) {}
     }
     const resp = await fetch(`${LOCAL_DAEMON_URL}/${method}`, {
         method: "POST",
@@ -38,20 +41,22 @@ const STEAM_NATIVE_CSS = `
     gap: 6px;
     height: 24px;
     padding: 0 10px;
-    margin: 0 4px;
-    background: rgba(61, 68, 80, 0.55);
-    color: #b8bcbf;
+    background: #23262e;
+    border: 1px solid #323844;
+    color: #dcdedf;
     border-radius: 2px;
     font-family: "Motiva Sans", Arial, Helvetica, sans-serif;
-    font-size: 12px;
-    font-weight: 400;
+    font-size: 11px;
+    font-weight: 500;
     cursor: pointer;
     user-select: none;
-    transition: background 0.12s ease, color 0.12s ease;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
     -webkit-app-region: no-drag;
+    box-sizing: border-box;
 }
 .se-top-btn:hover, .se-top-btn.se-active {
     background: #3d4450;
+    border-color: #66c0f4;
     color: #ffffff;
 }
 .se-badge-dot {
@@ -59,6 +64,7 @@ const STEAM_NATIVE_CSS = `
     height: 6px;
     border-radius: 50%;
     background: #66c0f4;
+    box-shadow: 0 0 6px #66c0f4;
     display: none;
 }
 .se-badge-dot.se-visible {
@@ -66,51 +72,83 @@ const STEAM_NATIVE_CSS = `
 }
 .se-popover {
     position: fixed;
-    top: 34px;
-    right: 220px;
-    width: 340px;
-    max-height: 460px;
+    width: 350px;
+    max-height: 500px;
     background: #171d25;
     border: 1px solid #2a313c;
-    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.75);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.85);
     color: #dcdedf;
     font-family: "Motiva Sans", Arial, Helvetica, sans-serif;
     font-size: 12px;
     z-index: 99999;
     display: flex;
     flex-direction: column;
-    border-radius: 2px;
+    border-radius: 3px;
+    overflow: hidden;
 }
-.se-tabs {
-    display: flex;
+.se-header-panel {
     background: #10151b;
+    padding: 10px 12px;
     border-bottom: 1px solid #232933;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
 }
-.se-tab {
-    flex: 1;
-    text-align: center;
-    padding: 8px 0;
-    color: #8b929a;
+.se-account-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.se-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #1b222c;
+    padding: 7px 10px;
+    border-radius: 2px;
+    border: 1px solid #262f3d;
+}
+.se-switch {
+    position: relative;
+    width: 34px;
+    height: 18px;
+    background: #323844;
+    border-radius: 10px;
     cursor: pointer;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.6px;
-    border-bottom: 2px solid transparent;
+    transition: background 0.15s ease;
+    flex-shrink: 0;
 }
-.se-tab:hover {
-    color: #dcdedf;
+.se-switch.se-on {
+    background: #1a9fff;
 }
-.se-tab.se-active {
-    color: #ffffff;
-    border-bottom-color: #1a9fff;
-    background: rgba(26, 159, 255, 0.06);
+.se-switch::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    background: #ffffff;
+    border-radius: 50%;
+    transition: transform 0.15s ease;
+}
+.se-switch.se-on::after {
+    transform: translateX(16px);
 }
 .se-body {
-    padding: 10px;
+    padding: 10px 12px;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 8px;
+}
+.se-section-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    color: #66c0f4;
+    font-weight: 600;
+    margin-top: 2px;
 }
 .se-card {
     background: #23262e;
@@ -120,7 +158,7 @@ const STEAM_NATIVE_CSS = `
 }
 .se-card img {
     width: 100%;
-    height: 110px;
+    height: 120px;
     object-fit: cover;
     display: block;
     background: #0e1217;
@@ -159,53 +197,165 @@ const STEAM_NATIVE_CSS = `
 .se-btn-primary {
     background: #1a9fff;
     color: #ffffff;
+    font-weight: 500;
 }
 .se-btn-primary:hover {
     background: #38aeff;
-}
-.se-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 8px;
-    background: #1e2329;
-    border-radius: 2px;
-}
-.se-row-title {
-    color: #dcdedf;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 205px;
 }
 .se-muted {
     color: #8b929a;
     font-size: 11px;
     line-height: 1.4;
 }
-.se-input {
-    background: #10151b;
-    border: 1px solid #2d333d;
-    color: #ffffff;
-    padding: 5px 8px;
-    border-radius: 2px;
-    font-size: 11px;
-    width: 100%;
-    box-sizing: border-box;
-}
 `;
 
-function openInSteamBrowser(url) {
-    if (window.SteamClient?.System?.OpenInSystemBrowser) {
-        window.SteamClient.System.OpenInSystemBrowser(url);
-    } else {
-        window.open(url, "_blank", "width=980,height=720");
+function openClaimPopup(url) {
+    // Open an in-Steam popup window where user stays logged in and can click "Get" + solve captcha
+    const w = 1020;
+    const h = 740;
+    const left = Math.max(0, Math.round((window.screen.width - w) / 2));
+    const top = Math.max(0, Math.round((window.screen.height - h) / 2));
+    window.open(
+        url,
+        "EpicGamesStoreClaim",
+        `width=${w},height=${h},left=${left},top=${top},menubar=no,toolbar=no,location=no,status=no`
+    );
+}
+
+function getStoredEpicAppIds() {
+    try {
+        const raw = localStorage.getItem(STORAGE_KEY_APPIDS);
+        const arr = raw ? JSON.parse(raw) : [];
+        return Array.isArray(arr) ? arr : [];
+    } catch (_) {
+        return [];
     }
+}
+
+function findExistingEpicShortcuts(helperPath) {
+    const ids = new Set(getStoredEpicAppIds());
+    try {
+        const apps = window.appStore?.allApps || [];
+        for (const app of apps) {
+            if (!app) continue;
+            const isShortcut =
+                typeof app.BIsModOrShortcut === "function"
+                    ? app.BIsModOrShortcut()
+                    : app.app_type === 1073741824;
+            if (!isShortcut) continue;
+            const name = app.display_name || "";
+            if (name.endsWith(" (Epic)")) {
+                ids.add(app.appid);
+            }
+        }
+    } catch (_) {}
+    return Array.from(ids);
+}
+
+async function applyEpicShortcutsToSteam(enable, statusLabelEl) {
+    if (!window.SteamClient?.Apps?.AddShortcut || !window.SteamClient?.Apps?.RemoveShortcut) {
+        await callBackend("SyncSteamShortcuts");
+        return;
+    }
+
+    if (!enable) {
+        if (statusLabelEl) statusLabelEl.textContent = "Odebírám Epic hry ze Steamu…";
+        const toRemove = findExistingEpicShortcuts();
+        for (const appid of toRemove) {
+            try {
+                window.SteamClient.Apps.RemoveShortcut(appid);
+            } catch (_) {}
+        }
+        localStorage.setItem(STORAGE_KEY_APPIDS, "[]");
+        localStorage.setItem(STORAGE_KEY_SYNC, "0");
+        if (statusLabelEl) statusLabelEl.textContent = "Zobrazit Epic hry ve Steam Knihovně";
+        return;
+    }
+
+    if (statusLabelEl) statusLabelEl.textContent = "Načítám hry z tvého Epicu…";
+    const lib = await callBackend("GetEpicLibrary");
+    if (!lib.authenticated) {
+        if (statusLabelEl) statusLabelEl.textContent = "Nejprve se přihlas k Epicu výše";
+        return;
+    }
+
+    // Remove previous Epic shortcuts first to avoid duplicates
+    const oldIds = findExistingEpicShortcuts(lib.helperPath);
+    for (const appid of oldIds) {
+        try {
+            window.SteamClient.Apps.RemoveShortcut(appid);
+        } catch (_) {}
+    }
+
+    const helperPath = lib.helperPath || "/home/maty/Epic Steam/backend/epic_helper.py";
+    const startDir = helperPath.substring(0, helperPath.lastIndexOf("/")) || "/usr/bin";
+    const createdIds = [];
+
+    for (const game of lib.games || []) {
+        try {
+            const displayName = `${game.title} (Epic)`;
+            const args = `launch ${game.appName}`;
+            const cmdline = `"${helperPath}" ${args}`;
+            const appid = await window.SteamClient.Apps.AddShortcut(
+                displayName,
+                helperPath,
+                args,
+                cmdline
+            );
+            if (appid) {
+                window.SteamClient.Apps.SetShortcutName?.(appid, displayName);
+                window.SteamClient.Apps.SetShortcutExe?.(appid, `"${helperPath}"`);
+                window.SteamClient.Apps.SetShortcutStartDir?.(appid, `"${startDir}"`);
+                window.SteamClient.Apps.SetShortcutLaunchOptions?.(appid, args);
+                createdIds.push(appid);
+            }
+        } catch (_) {}
+    }
+
+    localStorage.setItem(STORAGE_KEY_APPIDS, JSON.stringify(createdIds));
+    localStorage.setItem(STORAGE_KEY_SYNC, "1");
+    if (statusLabelEl) {
+        statusLabelEl.textContent = `Epic hry v Knihovně (${createdIds.length} her)`;
+    }
+}
+
+function positionButtonLeftOfMegaphone(doc, btn) {
+    // Find the top-right notification / megaphone area so we never overlap the user's long nickname
+    let anchorRight = 355;
+    let anchorTop = 6;
+
+    const candidates = Array.from(doc.querySelectorAll("button, div[role='button']"));
+    let minLeft = Infinity;
+    for (const el of candidates) {
+        const r = el.getBoundingClientRect();
+        // Top titlebar buttons sit at y < 34 and x > windowWidth / 2
+        if (r.top >= 0 && r.top <= 16 && r.height >= 16 && r.height <= 30 && r.left > doc.documentElement.clientWidth * 0.55) {
+            if (r.left < minLeft) {
+                minLeft = r.left;
+                anchorTop = Math.round(r.top);
+            }
+        }
+    }
+
+    if (minLeft < Infinity) {
+        anchorRight = Math.round(doc.documentElement.clientWidth - minLeft + 8);
+    }
+
+    btn.style.position = "fixed";
+    btn.style.top = `${anchorTop}px`;
+    btn.style.right = `${anchorRight}px`;
+    btn.style.zIndex = "99998";
 }
 
 function injectIntoWindow(win) {
     const doc = win.document;
-    if (!doc || !doc.body || doc.querySelector(".se-top-btn")) return;
+    if (!doc || !doc.body) return;
+
+    const existing = doc.querySelector(".se-top-btn");
+    if (existing) {
+        positionButtonLeftOfMegaphone(doc, existing);
+        return;
+    }
 
     if (!doc.getElementById("se-steam-styles")) {
         const style = doc.createElement("style");
@@ -225,22 +375,106 @@ function injectIntoWindow(win) {
     btn.appendChild(label);
 
     let popover = null;
-    let activeTab = "free";
     let cachedFree = null;
+    let loginPollTimer = null;
 
-    async function renderTabContent(bodyEl) {
-        bodyEl.innerHTML = '<div class="se-muted">Načítání…</div>';
+    async function renderPopover(popEl) {
+        popEl.innerHTML = '<div class="se-body"><div class="se-muted">Načítání…</div></div>';
         try {
-            if (activeTab === "free") {
-                const res = cachedFree || (await callBackend("GetFreeGames"));
-                cachedFree = res;
-                bodyEl.innerHTML = "";
-                if (!res.ok || !res.games?.length) {
-                    bodyEl.innerHTML = '<div class="se-muted">Momentálně nejsou žádné free hry.</div>';
-                    return;
-                }
+            const [authRes, freeRes] = await Promise.all([
+                callBackend("GetAuthStatus"),
+                cachedFree ? Promise.resolve(cachedFree) : callBackend("GetFreeGames"),
+            ]);
+            cachedFree = freeRes;
+            popEl.innerHTML = "";
+
+            // 1. Header panel: Login state + 1-click Library Sync Toggle
+            const header = doc.createElement("div");
+            header.className = "se-header-panel";
+
+            const accRow = doc.createElement("div");
+            accRow.className = "se-account-row";
+
+            if (!authRes.authenticated) {
+                const info = doc.createElement("span");
+                info.className = "se-muted";
+                info.textContent = "Epic účet není připojen";
+                const loginBtn = doc.createElement("button");
+                loginBtn.className = "se-btn se-btn-primary";
+                loginBtn.textContent = "Přihlásit se k Epicu";
+                loginBtn.onclick = async () => {
+                    loginBtn.textContent = "Otevírám přihlášení…";
+                    await callBackend("AuthenticateEpic", { auth_code: "" });
+                    if (loginPollTimer) clearInterval(loginPollTimer);
+                    loginPollTimer = setInterval(async () => {
+                        const st = await callBackend("GetAuthStatus");
+                        if (st.authenticated) {
+                            clearInterval(loginPollTimer);
+                            loginPollTimer = null;
+                            // Auto-enable library sync right after first login!
+                            await applyEpicShortcutsToSteam(true, null);
+                            if (popover) renderPopover(popover);
+                        }
+                    }, 2000);
+                };
+                accRow.append(info, loginBtn);
+                header.appendChild(accRow);
+            } else {
+                const info = doc.createElement("span");
+                info.style.cssText = "color:#ffffff;font-weight:500;";
+                info.textContent = `Epic: ${authRes.displayName}`;
+                const logoutBtn = doc.createElement("button");
+                logoutBtn.className = "se-btn";
+                logoutBtn.textContent = "Odhlásit";
+                logoutBtn.onclick = async () => {
+                    await applyEpicShortcutsToSteam(false, null);
+                    await callBackend("AuthenticateEpic", { auth_code: "logout" });
+                    if (popover) renderPopover(popover);
+                };
+                accRow.append(info, logoutBtn);
+
+                // Toggle switch: Show Epic games in Steam Library
+                const toggleRow = doc.createElement("div");
+                toggleRow.className = "se-toggle-row";
+                const isSyncOn = localStorage.getItem(STORAGE_KEY_SYNC) === "1";
+                const toggleLabel = doc.createElement("span");
+                toggleLabel.style.color = "#dcdedf";
+                const count = getStoredEpicAppIds().length;
+                toggleLabel.textContent = isSyncOn
+                    ? `Epic hry v Knihovně (${count} her)`
+                    : "Zobrazit Epic hry ve Steam Knihovně";
+
+                const sw = doc.createElement("div");
+                sw.className = `se-switch ${isSyncOn ? "se-on" : ""}`;
+                sw.onclick = async () => {
+                    const nextState = !sw.classList.contains("se-on");
+                    sw.classList.toggle("se-on", nextState);
+                    await applyEpicShortcutsToSteam(nextState, toggleLabel);
+                };
+
+                toggleRow.append(toggleLabel, sw);
+                header.append(accRow, toggleRow);
+            }
+
+            popEl.appendChild(header);
+
+            // 2. Body: Free games of the week
+            const body = doc.createElement("div");
+            body.className = "se-body";
+
+            const secTitle = doc.createElement("div");
+            secTitle.className = "se-section-title";
+            secTitle.textContent = "Právě zdarma na Epicu";
+            body.appendChild(secTitle);
+
+            if (!freeRes.ok || !freeRes.games?.length) {
+                const empty = doc.createElement("div");
+                empty.className = "se-muted";
+                empty.textContent = "Momentálně nejsou žádné free hry.";
+                body.appendChild(empty);
+            } else {
                 dot.classList.add("se-visible");
-                res.games.forEach((g) => {
+                freeRes.games.forEach((g) => {
                     const card = doc.createElement("div");
                     card.className = "se-card";
                     if (g.image) {
@@ -255,86 +489,17 @@ function injectIntoWindow(win) {
                     title.textContent = g.title;
                     const claimBtn = doc.createElement("button");
                     claimBtn.className = "se-btn se-btn-primary";
-                    claimBtn.textContent = "Vyzvednout";
-                    claimBtn.onclick = () => openInSteamBrowser(g.storeUrl);
-                    info.appendChild(title);
-                    info.appendChild(claimBtn);
+                    claimBtn.textContent = "Vyzvednout zdarma";
+                    claimBtn.onclick = () => openClaimPopup(g.storeUrl);
+                    info.append(title, claimBtn);
                     card.appendChild(info);
-                    bodyEl.appendChild(card);
-                });
-            } else {
-                const res = await callBackend("GetEpicLibrary");
-                bodyEl.innerHTML = "";
-                if (!res.authenticated) {
-                    const msg = doc.createElement("div");
-                    msg.className = "se-muted";
-                    msg.textContent = "Přihlas se jednou k Epic účtu (bez nutnosti instalovat Epic Launcher):";
-                    const loginBtn = doc.createElement("button");
-                    loginBtn.className = "se-btn se-btn-primary";
-                    loginBtn.textContent = "1. Otevřít přihlášení a získat kód";
-                    loginBtn.onclick = async () => {
-                        const authRes = await callBackend("AuthenticateEpic", { auth_code: "" });
-                        if (authRes.loginUrl) openInSteamBrowser(authRes.loginUrl);
-                    };
-                    const input = doc.createElement("input");
-                    input.className = "se-input";
-                    input.placeholder = "2. Vlož authorizationCode z prohlížeče…";
-                    const confirmBtn = doc.createElement("button");
-                    confirmBtn.className = "se-btn";
-                    confirmBtn.textContent = "Potvrdit přihlášení";
-                    confirmBtn.onclick = async () => {
-                        if (!input.value.trim()) return;
-                        confirmBtn.textContent = "Ověřování…";
-                        await callBackend("AuthenticateEpic", { auth_code: input.value.trim() });
-                        renderTabContent(bodyEl);
-                    };
-                    bodyEl.append(msg, loginBtn, input, confirmBtn);
-                    return;
-                }
-
-                const headerRow = doc.createElement("div");
-                headerRow.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;";
-                const userSpan = doc.createElement("span");
-                userSpan.className = "se-muted";
-                userSpan.textContent = `Účet: ${res.displayName || "Přihlášen"}`;
-                const syncBtn = doc.createElement("button");
-                syncBtn.className = "se-btn";
-                syncBtn.textContent = "Přidat vše do Steamu";
-                syncBtn.onclick = async () => {
-                    syncBtn.textContent = "Synchronizuji…";
-                    const syncRes = await callBackend("SyncSteamShortcuts");
-                    syncBtn.textContent = syncRes.ok ? `Hotovo (${syncRes.syncedCount})` : "Chyba";
-                };
-                headerRow.append(userSpan, syncBtn);
-                bodyEl.appendChild(headerRow);
-
-                if (!res.games?.length) {
-                    const empty = doc.createElement("div");
-                    empty.className = "se-muted";
-                    empty.textContent = "V knihovně nejsou žádné hry.";
-                    bodyEl.appendChild(empty);
-                    return;
-                }
-
-                res.games.forEach((g) => {
-                    const row = doc.createElement("div");
-                    row.className = "se-row";
-                    const t = doc.createElement("div");
-                    t.className = "se-row-title";
-                    t.textContent = g.title;
-                    const act = doc.createElement("button");
-                    act.className = g.installed ? "se-btn se-btn-primary" : "se-btn";
-                    act.textContent = g.installed ? "Hrát" : "Instalovat";
-                    act.onclick = async () => {
-                        act.textContent = g.installed ? "Spouštím…" : "Stahuji…";
-                        await callBackend("LaunchOrInstallEpicGame", { app_name: g.appName });
-                    };
-                    row.append(t, act);
-                    bodyEl.appendChild(row);
+                    body.appendChild(card);
                 });
             }
+
+            popEl.appendChild(body);
         } catch (err) {
-            bodyEl.innerHTML = `<div class="se-muted">Chyba: ${err.message || err}</div>`;
+            popEl.innerHTML = `<div class="se-body"><div class="se-muted">Chyba: ${err.message || err}</div></div>`;
         }
     }
 
@@ -343,6 +508,10 @@ function injectIntoWindow(win) {
             popover.remove();
             popover = null;
             btn.classList.remove("se-active");
+            if (loginPollTimer) {
+                clearInterval(loginPollTimer);
+                loginPollTimer = null;
+            }
             return;
         }
         btn.classList.add("se-active");
@@ -350,54 +519,17 @@ function injectIntoWindow(win) {
         popover.className = "se-popover";
 
         const rect = btn.getBoundingClientRect();
-        popover.style.top = `${Math.max(30, rect.bottom + 4)}px`;
+        popover.style.top = `${Math.max(32, rect.bottom + 6)}px`;
         popover.style.right = `${Math.max(12, doc.documentElement.clientWidth - rect.right)}px`;
 
-        const tabs = doc.createElement("div");
-        tabs.className = "se-tabs";
-        const tabFree = doc.createElement("div");
-        tabFree.className = `se-tab ${activeTab === "free" ? "se-active" : ""}`;
-        tabFree.textContent = "Zdarma";
-        const tabLib = doc.createElement("div");
-        tabLib.className = `se-tab ${activeTab === "lib" ? "se-active" : ""}`;
-        tabLib.textContent = "Knihovna";
-
-        const body = doc.createElement("div");
-        body.className = "se-body";
-
-        tabFree.onclick = () => {
-            activeTab = "free";
-            tabFree.className = "se-tab se-active";
-            tabLib.className = "se-tab";
-            renderTabContent(body);
-        };
-        tabLib.onclick = () => {
-            activeTab = "lib";
-            tabLib.className = "se-tab se-active";
-            tabFree.className = "se-tab";
-            renderTabContent(body);
-        };
-
-        tabs.append(tabFree, tabLib);
-        popover.append(tabs, body);
         doc.body.appendChild(popover);
-        renderTabContent(body);
+        renderPopover(popover);
     }
 
     btn.onclick = togglePopover;
-
-    // Place right next to the top-right notification bell / megaphone buttons in Steam
-    const targetBar =
-        doc.querySelector('[class*="TitleBarControls"]') ||
-        doc.querySelector('[class*="titlearea"]') ||
-        doc.body;
-
-    if (targetBar === doc.body) {
-        btn.style.cssText = "position:fixed;top:6px;right:330px;z-index:99998;";
-        doc.body.appendChild(btn);
-    } else {
-        targetBar.insertBefore(btn, targetBar.firstChild);
-    }
+    doc.body.appendChild(btn);
+    positionButtonLeftOfMegaphone(doc, btn);
+    win.addEventListener("resize", () => positionButtonLeftOfMegaphone(doc, btn));
 
     callBackend("GetFreeGames")
         .then((res) => {
