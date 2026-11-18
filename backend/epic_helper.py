@@ -415,6 +415,33 @@ def _download_artwork_bytes(app_name: str, kind: str, url: str) -> bytes:
     return b""
 
 
+def _ensure_png_icon(app_name: str, jpg_bytes: bytes) -> str:
+    """Converts tall/wide JPEG bytes into a 64x64 PNG file for Steam's left-sidebar SetShortcutIcon."""
+    if not jpg_bytes:
+        return ""
+    os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
+    safe_id = "".join(c for c in app_name if c.isalnum() or c in "-_")
+    icon_path = os.path.join(ARTWORK_CACHE_DIR, f"{safe_id}_icon.png")
+    if os.path.isfile(icon_path) and os.path.getsize(icon_path) > 100:
+        return icon_path
+    try:
+        import io
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(jpg_bytes)).convert("RGBA")
+        w, h = img.size
+        side = min(w, h)
+        left = (w - side) // 2
+        top = (h - side) // 2
+        img = img.crop((left, top, left + side, top + side)).resize(
+            (64, 64), Image.Resampling.LANCZOS
+        )
+        img.save(icon_path, format="PNG")
+        return icon_path
+    except Exception:
+        return ""
+
+
 def cache_steam_grid_artwork(items: list) -> dict:
     grid_dirs = []
     for cfg in glob.glob(os.path.expanduser("~/.steam/steam/userdata/*/config")):
@@ -429,13 +456,13 @@ def cache_steam_grid_artwork(items: list) -> dict:
             return False
         tall_bytes = _download_artwork_bytes(app_name, "tall", entry.get("tallCover", ""))
         wide_bytes = _download_artwork_bytes(app_name, "wide", entry.get("wideCover", ""))
+        _ensure_png_icon(app_name, tall_bytes or wide_bytes)
         for gdir in grid_dirs:
             if tall_bytes:
-                for suffix in ("p.jpg", "p.png"):
-                    p = os.path.join(gdir, f"{appid}{suffix}")
-                    if not os.path.isfile(p):
-                        with open(p, "wb") as f:
-                            f.write(tall_bytes)
+                p = os.path.join(gdir, f"{appid}p.jpg")
+                if not os.path.isfile(p):
+                    with open(p, "wb") as f:
+                        f.write(tall_bytes)
             if wide_bytes:
                 for suffix in (".jpg", "_hero.jpg"):
                     p = os.path.join(gdir, f"{appid}{suffix}")
@@ -453,11 +480,18 @@ def cache_steam_grid_artwork(items: list) -> dict:
     return {"ok": True, "queued": len(items)}
 
 
-def get_artwork_base64(app_name: str, kind: str, url: str) -> dict:
-    data = _download_artwork_bytes(app_name, kind, url)
-    if not data:
+def get_artwork_base64(app_name: str, tall_url: str, wide_url: str) -> dict:
+    tall_data = _download_artwork_bytes(app_name, "tall", tall_url)
+    wide_data = _download_artwork_bytes(app_name, "wide", wide_url)
+    icon_path = _ensure_png_icon(app_name, tall_data or wide_data)
+    if not tall_data and not wide_data:
         return {"ok": False}
-    return {"ok": True, "base64": base64.b64encode(data).decode("ascii")}
+    return {
+        "ok": True,
+        "tallBase64": base64.b64encode(tall_data).decode("ascii") if tall_data else "",
+        "wideBase64": base64.b64encode(wide_data).decode("ascii") if wide_data else "",
+        "iconPath": icon_path,
+    }
 
 
 def _vdf_str(key: str, val: str) -> bytes:
@@ -861,8 +895,8 @@ def dispatch_method(method: str, arg: str = "", extra: dict = None) -> dict:
     if method == "GetArtworkBase64":
         return get_artwork_base64(
             extra.get("appName", ""),
-            extra.get("kind", "tall"),
-            extra.get("url", ""),
+            extra.get("tallCover", "") or extra.get("url", ""),
+            extra.get("wideCover", "") or extra.get("url", ""),
         )
     if method == "debug_get":
         return LAST_DEBUG_REPORT

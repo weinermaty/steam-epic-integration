@@ -15,7 +15,7 @@ const PLUGIN_NAME = "steam-epic-integration";
 const LOCAL_DAEMON_URL = "http://127.0.0.1:49812";
 const STORAGE_KEY_SYNC = "se_epic_library_enabled";
 const STORAGE_KEY_APPIDS = "se_epic_shortcut_appids";
-const STORAGE_KEY_ART_DONE = "se_epic_artwork_applied_v1";
+const STORAGE_KEY_ART_DONE = "se_epic_artwork_applied_v2";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -355,7 +355,7 @@ async function streamEpicCoverArtInBackground(gamesWithIds, onProgressText) {
         doneSet = {};
     }
 
-    const pending = gamesWithIds.filter((g) => g.tallCover && !doneSet[g.appid]);
+    const pending = gamesWithIds.filter((g) => (g.tallCover || g.wideCover) && !doneSet[g.appid]);
     if (pending.length === 0) return;
 
     let doneCount = gamesWithIds.length - pending.length;
@@ -364,11 +364,22 @@ async function streamEpicCoverArtInBackground(gamesWithIds, onProgressText) {
         try {
             const res = await callBackend("GetArtworkBase64", {
                 appName: item.appName,
-                kind: "tall",
-                url: item.tallCover,
+                tallCover: item.tallCover || "",
+                wideCover: item.wideCover || "",
             });
-            if (res?.ok && res.base64) {
-                await window.SteamClient.Apps.SetCustomArtworkForApp(item.appid, res.base64, "jpg", 0);
+            if (res?.ok) {
+                if (res.iconPath && window.SteamClient?.Apps?.SetShortcutIcon) {
+                    try {
+                        await window.SteamClient.Apps.SetShortcutIcon(item.appid, res.iconPath);
+                    } catch (_) {}
+                }
+                if (res.tallBase64) {
+                    await window.SteamClient.Apps.SetCustomArtworkForApp(item.appid, res.tallBase64, "jpg", 0);
+                }
+                if (res.wideBase64) {
+                    await window.SteamClient.Apps.SetCustomArtworkForApp(item.appid, res.wideBase64, "jpg", 1);
+                    await window.SteamClient.Apps.SetCustomArtworkForApp(item.appid, res.wideBase64, "jpg", 3);
+                }
                 doneSet[item.appid] = 1;
                 doneCount++;
                 if (doneCount % 10 === 0) {
@@ -379,7 +390,7 @@ async function streamEpicCoverArtInBackground(gamesWithIds, onProgressText) {
                 }
             }
         } catch (_) {}
-        await sleep(35);
+        await sleep(30);
     }
     localStorage.setItem(STORAGE_KEY_ART_DONE, JSON.stringify(doneSet));
     if (onProgressText) {
