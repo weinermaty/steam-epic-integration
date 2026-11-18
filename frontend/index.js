@@ -720,44 +720,32 @@ async function injectEpicDownloadsSection(doc) {
 }
 
 async function updateEpicGameDetailsStatus(doc) {
-    const containers = Array.from(doc.querySelectorAll('[class*="PlayButtonContainer"]'));
+    if (doc.title !== "Steam") return;
 
-    let displayName = "";
-    const href = doc.location?.href || doc.URL || "";
     const histPath = window.MainWindowBrowserManager?.m_history?.location?.pathname || "";
-    const m = href.match(/\/library\/app\/(\d+)/) || histPath.match(/\/library\/app\/(\d+)/);
+    const m = histPath.match(/\/library\/app\/(\d+)/);
     const selectedAppId = m ? Number(m[1]) : window.uiStore?.currentGameListSelection?.nAppId;
+    if (!selectedAppId) return;
 
-    if (selectedAppId) {
-        const ov = window.appStore?.GetAppOverviewByAppID?.(Number(selectedAppId));
-        displayName = ov?.display_name || "";
-    }
+    const ov = window.appStore?.GetAppOverviewByAppID?.(Number(selectedAppId));
+    const displayName = ov?.display_name || "";
+    const containers = Array.from(doc.querySelectorAll('[class*="PlayButtonContainer"]'));
+    if (containers.length === 0) return;
 
-    if (!displayName && containers.length > 0) {
-        const headings = Array.from(doc.querySelectorAll("div, span, h1, h2"));
-        for (const h of headings) {
-            if (h.children.length > 0) continue;
-            const t = (h.textContent || "").trim();
-            if (!t.endsWith(" (Epic)")) continue;
-            const r = h.getBoundingClientRect();
-            if (r.left > 240 && r.width > 80 && r.height >= 24) {
-                const fs = parseFloat(doc.defaultView?.getComputedStyle(h)?.fontSize || "0");
-                if (fs >= 20) {
-                    displayName = t;
-                    break;
-                }
-            }
-        }
-    }
+    // Remove any legacy pills from earlier versions
+    doc.querySelectorAll(".se-epic-status-pill").forEach((el) => el.remove());
 
     if (!displayName.endsWith(" (Epic)")) {
-        doc.querySelectorAll(".se-epic-status-pill").forEach((el) => el.remove());
         for (const container of containers) {
             if (container.dataset.seEpicInstallBtn === "1") {
                 const playBtn = container.querySelector('[class*="PlayButton"]') || container;
                 const btnTextEl = container.querySelector('[class*="ButtonText"]') || playBtn;
                 if (btnTextEl && container.dataset.seOrigText) {
-                    btnTextEl.textContent = container.dataset.seOrigText;
+                    if (btnTextEl.firstChild?.nodeType === 3) {
+                        btnTextEl.firstChild.nodeValue = container.dataset.seOrigText;
+                    } else {
+                        btnTextEl.textContent = container.dataset.seOrigText;
+                    }
                 }
                 container.classList.remove("se-epic-install-btn");
                 playBtn.classList.remove("se-epic-install-btn");
@@ -766,7 +754,6 @@ async function updateEpicGameDetailsStatus(doc) {
         }
         return;
     }
-    if (containers.length === 0) return;
 
     const now = Date.now();
     if (!cachedUpdatesData || now - lastDownloadsCheckTs > 4000) {
@@ -787,9 +774,6 @@ async function updateEpicGameDetailsStatus(doc) {
     for (const container of containers) {
         const playBtn = container.querySelector('[class*="PlayButton"]') || container;
         const btnTextEl = container.querySelector('[class*="ButtonText"]') || playBtn;
-        const rect = container.getBoundingClientRect();
-        const isMainHeroBtn = rect.top > 180;
-        let pill = isMainHeroBtn ? doc.querySelector(".se-epic-status-pill") : null;
 
         if (!installed || activeTransfer) {
             const targetLabel = activeTransfer
@@ -800,37 +784,27 @@ async function updateEpicGameDetailsStatus(doc) {
                     container.dataset.seOrigText = btnTextEl.textContent || "Play";
                 }
                 if (btnTextEl.textContent.trim() !== targetLabel) {
-                    btnTextEl.textContent = targetLabel;
+                    if (btnTextEl.firstChild?.nodeType === 3) {
+                        btnTextEl.firstChild.nodeValue = targetLabel;
+                    } else {
+                        btnTextEl.textContent = targetLabel;
+                    }
                 }
             }
             container.classList.add("se-epic-install-btn");
             playBtn.classList.add("se-epic-install-btn");
             container.dataset.seEpicInstallBtn = "1";
-
-            if (isMainHeroBtn) {
-                if (!pill && container.parentElement) {
-                    pill = doc.createElement("span");
-                    pill.className = "se-epic-status-pill";
-                    container.parentElement.insertAdjacentElement("afterend", pill);
-                }
-                if (pill) {
-                    pill.textContent = activeTransfer
-                        ? `Epic • Stahování (${Math.round(activeTransfer.progress || 0)}%)`
-                        : "Epic • Nenainstalováno";
-                }
-            }
-        } else {
-            if (container.dataset.seEpicInstallBtn === "1") {
-                if (btnTextEl && container.dataset.seOrigText) {
+        } else if (container.dataset.seEpicInstallBtn === "1") {
+            if (btnTextEl && container.dataset.seOrigText) {
+                if (btnTextEl.firstChild?.nodeType === 3) {
+                    btnTextEl.firstChild.nodeValue = container.dataset.seOrigText;
+                } else {
                     btnTextEl.textContent = container.dataset.seOrigText;
                 }
-                container.classList.remove("se-epic-install-btn");
-                playBtn.classList.remove("se-epic-install-btn");
-                delete container.dataset.seEpicInstallBtn;
             }
-            if (isMainHeroBtn && pill) {
-                pill.textContent = "Epic • Nainstalováno";
-            }
+            container.classList.remove("se-epic-install-btn");
+            playBtn.classList.remove("se-epic-install-btn");
+            delete container.dataset.seEpicInstallBtn;
         }
     }
 }
@@ -1136,8 +1110,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 3) return;
-    window.__SE_EPIC_VERSION = 3;
+    if (window.__SE_EPIC_VERSION === 4) return;
+    window.__SE_EPIC_VERSION = 4;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }

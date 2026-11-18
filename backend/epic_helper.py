@@ -278,33 +278,56 @@ def get_epic_updates_and_downloads(check_remote: bool = False) -> dict:
     Legendary downloads/updates so the frontend can render them in Steam's Downloads window.
     """
     updates = []
-    try:
-        from legendary.core import LegendaryCore
+    if check_remote:
+        try:
+            from legendary.core import LegendaryCore
 
-        core = LegendaryCore()
-        if check_remote and core.login():
-            for plat in core.get_installed_platforms():
-                core.get_assets(update_assets=True, platform=plat)
+            core = LegendaryCore()
+            if core.login():
+                for plat in core.get_installed_platforms():
+                    core.get_assets(update_assets=True, platform=plat)
 
-        installed_games = core.get_installed_list(include_dlc=False)
-        for ig in installed_games:
+            installed_games = core.get_installed_list(include_dlc=False)
+            for ig in installed_games:
+                try:
+                    latest_ver = core.get_asset(ig.app_name, platform=ig.platform).build_version
+                except Exception:
+                    latest_ver = ig.version
+                has_update = bool(latest_ver and ig.version and latest_ver != ig.version)
+                updates.append(
+                    {
+                        "appName": ig.app_name,
+                        "title": ig.title,
+                        "installedVersion": ig.version,
+                        "latestVersion": latest_ver,
+                        "hasUpdate": has_update,
+                        "installSize": ig.install_size,
+                    }
+                )
+        except Exception:
+            pass
+    else:
+        installed_json = os.path.expanduser("~/.config/legendary/installed.json")
+        if os.path.isfile(installed_json):
             try:
-                latest_ver = core.get_asset(ig.app_name, platform=ig.platform).build_version
+                with open(installed_json, "r", encoding="utf-8") as f:
+                    inst_data = json.load(f)
+                for app_name, info in inst_data.items():
+                    if info.get("is_dlc"):
+                        continue
+                    ver = info.get("version", "")
+                    updates.append(
+                        {
+                            "appName": app_name,
+                            "title": info.get("title", app_name),
+                            "installedVersion": ver,
+                            "latestVersion": ver,
+                            "hasUpdate": False,
+                            "installSize": info.get("install_size", 0),
+                        }
+                    )
             except Exception:
-                latest_ver = ig.version
-            has_update = bool(latest_ver and ig.version and latest_ver != ig.version)
-            updates.append(
-                {
-                    "appName": ig.app_name,
-                    "title": ig.title,
-                    "installedVersion": ig.version,
-                    "latestVersion": latest_ver,
-                    "hasUpdate": has_update,
-                    "installSize": ig.install_size,
-                }
-            )
-    except Exception:
-        pass
+                pass
 
     with _DOWNLOADS_LOCK:
         transfers = list(_ACTIVE_DOWNLOADS.values())
