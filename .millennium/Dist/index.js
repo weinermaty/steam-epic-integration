@@ -720,8 +720,9 @@ async function injectEpicDownloadsSection(doc) {
 }
 
 async function updateEpicGameDetailsStatus(doc) {
-    const candidates = Array.from(doc.querySelectorAll("button, [role='button'], div[class*='PlayButton']"));
+    const candidates = Array.from(doc.querySelectorAll("button, [role='button'], div"));
     let playBtn = null;
+    let bestArea = Infinity;
     for (const el of candidates) {
         if (el.closest(".se-top-btn, .se-dl-section, .se-popup-root")) continue;
         const txt = (el.textContent || "").trim().toLowerCase();
@@ -732,9 +733,19 @@ async function updateEpicGameDetailsStatus(doc) {
             txt.startsWith("stahuje se")
         ) {
             const rect = el.getBoundingClientRect();
-            if (rect.width >= 60 && rect.height >= 24 && rect.left > 200) {
-                playBtn = el;
-                break;
+            if (
+                rect.width >= 80 &&
+                rect.width <= 320 &&
+                rect.height >= 30 &&
+                rect.height <= 64 &&
+                rect.left > 200 &&
+                rect.top > 80
+            ) {
+                const area = rect.width * rect.height;
+                if (area < bestArea) {
+                    bestArea = area;
+                    playBtn = el;
+                }
             }
         }
     }
@@ -1142,6 +1153,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
+    if (window.__SE_EPIC_LOADED) return;
+    window.__SE_EPIC_LOADED = true;
     setInterval(() => {
         try {
             healBlankSteamBrowser();
