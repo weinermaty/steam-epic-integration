@@ -319,32 +319,37 @@ async function applyEpicShortcutsToSteam(enable, statusLabelEl) {
     }
 }
 
-function positionButtonLeftOfMegaphone(doc, btn) {
-    // Find the top-right notification / megaphone area so we never overlap the user's long nickname
-    let anchorRight = 355;
-    let anchorTop = 6;
-
-    const candidates = Array.from(doc.querySelectorAll("button, div[role='button']"));
-    let minLeft = Infinity;
-    for (const el of candidates) {
-        const r = el.getBoundingClientRect();
-        // Top titlebar buttons sit at y < 34 and x > windowWidth / 2
-        if (r.top >= 0 && r.top <= 16 && r.height >= 16 && r.height <= 30 && r.left > doc.documentElement.clientWidth * 0.55) {
-            if (r.left < minLeft) {
-                minLeft = r.left;
-                anchorTop = Math.round(r.top);
-            }
+function placeButtonInSteamTopBar(doc, btn) {
+    // 1. Best: insert as the first flex item inside Steam's TitleBarControls container
+    //    so flexbox automatically pushes the megaphone, bell, and nickname without overlapping!
+    const titleBarControls =
+        doc.querySelector("._1-9sir4j_KQiMqdkZjQN0u") ||
+        doc.querySelector('[class*="TitleBarControls"]');
+    if (titleBarControls) {
+        btn.style.position = "relative";
+        btn.style.top = "0";
+        btn.style.right = "auto";
+        btn.style.marginRight = "6px";
+        if (btn.parentElement !== titleBarControls) {
+            titleBarControls.insertBefore(btn, titleBarControls.firstChild);
         }
+        return;
     }
 
-    if (minLeft < Infinity) {
-        anchorRight = Math.round(doc.documentElement.clientWidth - minLeft + 8);
+    // 2. Fallback: insert right after "Help" in RootMenuBar (Steam | View | Friends | Games | Help | • Epic)
+    const rootMenu =
+        doc.querySelector("._3s0lkohH8wU2do0K1il28Y") ||
+        doc.querySelector('[class*="RootMenuBar"]');
+    if (rootMenu) {
+        btn.style.position = "relative";
+        btn.style.top = "0";
+        btn.style.right = "auto";
+        btn.style.marginLeft = "8px";
+        if (btn.parentElement !== rootMenu) {
+            rootMenu.appendChild(btn);
+        }
+        return;
     }
-
-    btn.style.position = "fixed";
-    btn.style.top = `${anchorTop}px`;
-    btn.style.right = `${anchorRight}px`;
-    btn.style.zIndex = "99998";
 }
 
 function injectIntoWindow(win) {
@@ -353,7 +358,7 @@ function injectIntoWindow(win) {
 
     const existing = doc.querySelector(".se-top-btn");
     if (existing) {
-        positionButtonLeftOfMegaphone(doc, existing);
+        placeButtonInSteamTopBar(doc, existing);
         return;
     }
 
@@ -527,9 +532,7 @@ function injectIntoWindow(win) {
     }
 
     btn.onclick = togglePopover;
-    doc.body.appendChild(btn);
-    positionButtonLeftOfMegaphone(doc, btn);
-    win.addEventListener("resize", () => positionButtonLeftOfMegaphone(doc, btn));
+    placeButtonInSteamTopBar(doc, btn);
 
     callBackend("GetFreeGames")
         .then((res) => {
