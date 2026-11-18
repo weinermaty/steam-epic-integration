@@ -135,11 +135,15 @@ const STEAM_BUTTON_CSS = `
     background: #1a9fff;
     transition: width 0.3s ease;
 }
-.se-epic-install-btn {
+.se-epic-install-btn,
+body[data-se-epic-uninstalled="1"] [class*="PlayButtonContainer"],
+body[data-se-epic-uninstalled="1"] [class*="PlayButton"] {
     background: linear-gradient(90deg, #1a9fff 0%, #0066cc 100%) !important;
     box-shadow: 0 2px 8px rgba(26, 159, 255, 0.35) !important;
 }
-.se-epic-install-btn:hover {
+.se-epic-install-btn:hover,
+body[data-se-epic-uninstalled="1"] [class*="PlayButtonContainer"]:hover,
+body[data-se-epic-uninstalled="1"] [class*="PlayButton"]:hover {
     background: linear-gradient(90deg, #33adff 0%, #0077ee 100%) !important;
 }
 .se-epic-status-pill {
@@ -719,23 +723,47 @@ async function injectEpicDownloadsSection(doc) {
     }
 }
 
-async function updateEpicGameDetailsStatus(doc) {
-    if (doc.title !== "Steam") return;
+function refreshUpdatesCacheAsync(doc) {
+    const now = Date.now();
+    if (now - lastDownloadsCheckTs <= 4000) return;
+    lastDownloadsCheckTs = now;
+    callBackend("GetEpicUpdates", { checkRemote: false })
+        .then((res) => {
+            if (res) {
+                cachedUpdatesData = res;
+                if (doc) updateEpicGameDetailsStatus(doc);
+            }
+        })
+        .catch(() => {});
+}
+
+function updateEpicGameDetailsStatus(doc) {
+    if (!doc || doc.title !== "Steam" || !doc.body) return;
+
+    if (!doc.body.dataset.seObsAttached) {
+        doc.body.dataset.seObsAttached = "1";
+        try {
+            const obs = new MutationObserver(() => {
+                updateEpicGameDetailsStatus(doc);
+            });
+            obs.observe(doc.body, { childList: true, subtree: true });
+        } catch (_) {}
+    }
 
     const histPath = window.MainWindowBrowserManager?.m_history?.location?.pathname || "";
     const m = histPath.match(/\/library\/app\/(\d+)/);
     const selectedAppId = m ? Number(m[1]) : window.uiStore?.currentGameListSelection?.nAppId;
-    if (!selectedAppId) return;
+    if (!selectedAppId) {
+        delete doc.body.dataset.seEpicUninstalled;
+        return;
+    }
 
     const ov = window.appStore?.GetAppOverviewByAppID?.(Number(selectedAppId));
     const displayName = ov?.display_name || "";
     const containers = Array.from(doc.querySelectorAll('[class*="PlayButtonContainer"]'));
-    if (containers.length === 0) return;
-
-    // Remove any legacy pills from earlier versions
-    doc.querySelectorAll(".se-epic-status-pill").forEach((el) => el.remove());
 
     if (!displayName.endsWith(" (Epic)")) {
+        delete doc.body.dataset.seEpicUninstalled;
         for (const container of containers) {
             if (container.dataset.seEpicInstallBtn === "1") {
                 const playBtn = container.querySelector('[class*="PlayButton"]') || container;
@@ -755,13 +783,7 @@ async function updateEpicGameDetailsStatus(doc) {
         return;
     }
 
-    const now = Date.now();
-    if (!cachedUpdatesData || now - lastDownloadsCheckTs > 4000) {
-        lastDownloadsCheckTs = now;
-        try {
-            cachedUpdatesData = await callBackend("GetEpicUpdates", { checkRemote: false });
-        } catch (_) {}
-    }
+    refreshUpdatesCacheAsync(doc);
 
     const baseTitle = displayName.slice(0, -7);
     const installed = (cachedUpdatesData?.installedGames || []).some(
@@ -770,6 +792,14 @@ async function updateEpicGameDetailsStatus(doc) {
     const activeTransfer = (cachedUpdatesData?.activeTransfers || []).find(
         (t) => (t.title === baseTitle || `${t.title} (Epic)` === displayName) && t.status === "downloading"
     );
+
+    if (!installed || activeTransfer) {
+        doc.body.dataset.seEpicUninstalled = "1";
+    } else {
+        delete doc.body.dataset.seEpicUninstalled;
+    }
+
+    if (containers.length === 0) return;
 
     for (const container of containers) {
         const playBtn = container.querySelector('[class*="PlayButton"]') || container;
@@ -1110,11 +1140,13 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 4) return;
-    window.__SE_EPIC_VERSION = 4;
+    if (window.__SE_EPIC_VERSION === 5) return;
+    window.__SE_EPIC_VERSION = 5;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
+
+    refreshUpdatesCacheAsync(null);
 
     const tick = () => {
         try {
@@ -1132,8 +1164,8 @@ function initPlugin() {
 
     try {
         window.MainWindowBrowserManager?.m_history?.listen?.(() => {
-            setTimeout(tick, 40);
-            setTimeout(tick, 180);
+            tick();
+            Promise.resolve().then(tick);
         });
     } catch (_) {}
 
