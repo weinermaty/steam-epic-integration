@@ -689,6 +689,11 @@ async function injectEpicDownloadsSection(doc) {
         return;
     }
 
+    const renderKey = JSON.stringify({ pending, active });
+    if (container && container.dataset.seRenderKey === renderKey) {
+        return;
+    }
+
     if (!container) {
         container = doc.createElement("div");
         container.className = "se-dl-section";
@@ -700,6 +705,7 @@ async function injectEpicDownloadsSection(doc) {
         }
     }
 
+    container.dataset.seRenderKey = renderKey;
     container.innerHTML = "";
     const hdr = doc.createElement("div");
     hdr.className = "se-dl-header";
@@ -805,8 +811,16 @@ function updateEpicGameDetailsStatus(doc) {
     if (!doc.body.dataset.seObsAttached) {
         doc.body.dataset.seObsAttached = "1";
         try {
+            let seMutating = false;
             const obs = new MutationObserver(() => {
-                updateEpicGameDetailsStatus(doc);
+                if (seMutating) return;
+                seMutating = true;
+                try {
+                    updateEpicGameDetailsStatus(doc);
+                } finally {
+                    obs.takeRecords();
+                    seMutating = false;
+                }
             });
             obs.observe(doc.body, { childList: true, subtree: true, characterData: true });
             doc.addEventListener("scroll", () => syncSidebarEpicRows(doc), { capture: true, passive: true });
@@ -1216,8 +1230,8 @@ function injectIntoWindow(win) {
 }
 
 function initPlugin() {
-    if (window.__SE_EPIC_VERSION === 11) return;
-    window.__SE_EPIC_VERSION = 11;
+    if (window.__SE_EPIC_VERSION === 12) return;
+    window.__SE_EPIC_VERSION = 12;
     if (window.__SE_EPIC_TIMER) {
         clearInterval(window.__SE_EPIC_TIMER);
     }
