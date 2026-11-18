@@ -16,6 +16,7 @@ const LOCAL_DAEMON_URL = "http://127.0.0.1:49812";
 const STORAGE_KEY_SYNC = "se_epic_library_enabled";
 const STORAGE_KEY_APPIDS = "se_epic_shortcut_appids";
 const STORAGE_KEY_ART_DONE = "se_epic_artwork_applied_v4";
+const STORAGE_KEY_SEEN_FREE = "se_seen_free_ids";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -67,16 +68,27 @@ const STEAM_BUTTON_CSS = `
     border-color: #66c0f4;
     color: #ffffff;
 }
+.se-top-btn.se-has-new {
+    border-color: rgba(102, 192, 244, 0.7);
+}
 .se-badge-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: #66c0f4;
-    box-shadow: 0 0 6px #66c0f4;
     display: none;
+    align-items: center;
+    justify-content: center;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 3px;
+    border-radius: 7px;
+    background: #1a9fff;
+    color: #ffffff;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 14px;
+    box-shadow: 0 0 8px rgba(26, 159, 255, 0.75);
+    box-sizing: border-box;
 }
 .se-badge-dot.se-visible {
-    display: inline-block;
+    display: inline-flex;
 }
 .se-dl-section {
     margin: 12px 24px;
@@ -522,7 +534,38 @@ function notifyStateSubscribers() {
     }
 }
 
-async function refreshPreloadedState(dotEl, forceFree = false) {
+function getFreeGameIds(games) {
+    return (games || []).map((g) => g.id || g.title).filter(Boolean);
+}
+
+function hasUnseenFreeGames(games) {
+    const ids = getFreeGameIds(games);
+    if (ids.length === 0) return false;
+    try {
+        const seen = JSON.parse(localStorage.getItem(STORAGE_KEY_SEEN_FREE) || "[]");
+        const seenSet = new Set(Array.isArray(seen) ? seen : []);
+        return ids.some((id) => !seenSet.has(id));
+    } catch (_) {
+        return true;
+    }
+}
+
+function markFreeGamesSeen(games) {
+    const ids = getFreeGameIds(games);
+    if (ids.length === 0) return;
+    try {
+        localStorage.setItem(STORAGE_KEY_SEEN_FREE, JSON.stringify(ids));
+    } catch (_) {}
+}
+
+function updateNewFreeBadge(badgeEl, btnEl, games) {
+    if (!badgeEl) return;
+    const unseen = hasUnseenFreeGames(games);
+    badgeEl.classList.toggle("se-visible", unseen);
+    if (btnEl) btnEl.classList.toggle("se-has-new", unseen);
+}
+
+async function refreshPreloadedState(badgeEl, forceFree = false, btnEl = null) {
     try {
         const [authRes, freeRes] = await Promise.all([
             callBackend("GetAuthStatus"),
@@ -533,9 +576,7 @@ async function refreshPreloadedState(dotEl, forceFree = false) {
             freeGames: freeRes?.games || [],
             ready: true,
         };
-        if (dotEl && preloadedState.freeGames.length > 0) {
-            dotEl.classList.add("se-visible");
-        }
+        updateNewFreeBadge(badgeEl, btnEl, preloadedState.freeGames);
         notifyStateSubscribers();
 
         // Check if user just finished claiming a free game in the checkout window
@@ -847,6 +888,7 @@ function injectIntoWindow(win) {
     btn.title = "Epic Free Games & Knihovna";
     const dot = doc.createElement("span");
     dot.className = "se-badge-dot";
+    dot.textContent = "!";
     const label = doc.createElement("span");
     label.textContent = "Epic";
     btn.appendChild(dot);
@@ -902,7 +944,7 @@ function injectIntoWindow(win) {
 
     // Poll every 4 seconds for completed free-game claims and weekly free-game rotation
     setInterval(() => {
-        refreshPreloadedState(dot, false);
+        refreshPreloadedState(dot, false, btn);
     }, 4000);
 
     btn.addEventListener("mousedown", (ev) => {
@@ -922,12 +964,16 @@ function injectIntoWindow(win) {
             return;
         }
 
+        // Player opened the menu and checked the current free games -> clear the "!" alert
+        markFreeGamesSeen(preloadedState.freeGames);
+        updateNewFreeBadge(dot, btn, preloadedState.freeGames);
+
         btn.classList.add("se-active");
         inst.Show();
-        refreshPreloadedState(dot);
+        refreshPreloadedState(dot, false, btn);
     });
 
-    refreshPreloadedState(dot).then(() => {
+    refreshPreloadedState(dot, false, btn).then(() => {
         const existingCount = getExistingEpicShortcutsMap().size;
         if (existingCount > 0) {
             localStorage.setItem(STORAGE_KEY_SYNC, "1");
