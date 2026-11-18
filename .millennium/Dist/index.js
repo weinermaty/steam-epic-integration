@@ -720,20 +720,59 @@ async function injectEpicDownloadsSection(doc) {
 }
 
 async function updateEpicGameDetailsStatus(doc) {
-    const href = doc.location?.href || doc.URL || "";
-    const m = href.match(/\/library\/app\/(\d+)/);
-    if (!m) {
-        doc.querySelectorAll(".se-epic-status-pill").forEach((el) => el.remove());
-        return;
+    const candidates = Array.from(doc.querySelectorAll("button, [role='button'], div[class*='PlayButton']"));
+    let playBtn = null;
+    for (const el of candidates) {
+        if (el.closest(".se-top-btn, .se-dl-section, .se-popup-root")) continue;
+        const txt = (el.textContent || "").trim().toLowerCase();
+        if (
+            txt === "play" ||
+            txt === "hrát" ||
+            txt === "nainstalovat (epic)" ||
+            txt.startsWith("stahuje se")
+        ) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width >= 60 && rect.height >= 24 && rect.left > 200) {
+                playBtn = el;
+                break;
+            }
+        }
     }
 
-    const appid = Number(m[1]);
-    const ov = window.appStore?.GetAppOverviewByAppID?.(appid);
-    const displayName = ov?.display_name || "";
+    let displayName = "";
+    const href = doc.location?.href || doc.URL || "";
+    const histPath = window.MainWindowBrowserManager?.m_history?.location?.pathname || "";
+    const m = href.match(/\/library\/app\/(\d+)/) || histPath.match(/\/library\/app\/(\d+)/);
+    const selectedAppId = m ? Number(m[1]) : window.uiStore?.currentGameListSelection?.nAppId;
+
+    if (selectedAppId) {
+        const ov = window.appStore?.GetAppOverviewByAppID?.(Number(selectedAppId));
+        displayName = ov?.display_name || "";
+    }
+
+    if (!displayName && playBtn) {
+        // Fallback: find the large game title rendered in the Game Details header
+        const headings = Array.from(doc.querySelectorAll("div, span, h1, h2"));
+        for (const h of headings) {
+            if (h.children.length > 0) continue;
+            const t = (h.textContent || "").trim();
+            if (!t.endsWith(" (Epic)")) continue;
+            const r = h.getBoundingClientRect();
+            if (r.left > 240 && r.width > 80 && r.height >= 24) {
+                const fs = parseFloat(doc.defaultView?.getComputedStyle(h)?.fontSize || "0");
+                if (fs >= 20) {
+                    displayName = t;
+                    break;
+                }
+            }
+        }
+    }
+
     if (!displayName.endsWith(" (Epic)")) {
         doc.querySelectorAll(".se-epic-status-pill").forEach((el) => el.remove());
         return;
     }
+    if (!playBtn) return;
 
     const now = Date.now();
     if (!cachedUpdatesData || now - lastDownloadsCheckTs > 4000) {
@@ -750,26 +789,6 @@ async function updateEpicGameDetailsStatus(doc) {
     const activeTransfer = (cachedUpdatesData?.activeTransfers || []).find(
         (t) => (t.title === baseTitle || `${t.title} (Epic)` === displayName) && t.status === "downloading"
     );
-
-    const candidates = Array.from(doc.querySelectorAll("button, [role='button'], div[class*='PlayButton']"));
-    let playBtn = null;
-    for (const el of candidates) {
-        if (el.closest(".se-top-btn, .se-dl-section, .se-popup-root")) continue;
-        const txt = (el.textContent || "").trim().toLowerCase();
-        if (
-            txt === "play" ||
-            txt === "hrát" ||
-            txt === "nainstalovat (epic)" ||
-            txt.startsWith("stahuje se")
-        ) {
-            const rect = el.getBoundingClientRect();
-            if (rect.width >= 60 && rect.height >= 24) {
-                playBtn = el;
-                break;
-            }
-        }
-    }
-    if (!playBtn) return;
 
     const findTextNode = (root) => {
         const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);

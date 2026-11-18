@@ -1083,7 +1083,7 @@ def run_daemon():
     def watcher():
         while True:
             ensure_steamui_injected()
-            time.sleep(10)
+            time.sleep(1)
 
     t = threading.Thread(target=watcher, daemon=True)
     t.start()
