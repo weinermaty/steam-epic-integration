@@ -4,8 +4,11 @@
  *    matching Steam's native Notifications and Account menus.
  * 2. Throttled, smart diffing for 350+ Epic games — never freezes or crashes Steam, skips already-added
  *    games, and streams Epic cover artwork (capsule + hero) into Steam Library in the background.
- * 3. Direct 1-step authenticated Epic checkout modal — uses Legendary's OAuth exchange token to log in
- *    automatically in the background and open straight on the "Place Order" / Captcha dialog.
+ * 3. Direct 1-step authenticated Epic checkout modal — uses 32-char opaque EPIC_BEARER_TOKEN cookie
+ *    in WebKit2 to open straight on `#/free-checkout` ("Add to library" / hCaptcha) without login prompts.
+ * 4. Post-claim auto-sync — when a free game is claimed, it is automatically added to Steam Library.
+ * 5. Native Steam Downloads page integration — injects Epic Games updates & active downloads directly
+ *    into Steam's Downloads window (`._1bq4x9pa4-9RLY-dXWUZTp`).
  */
 
 const PLUGIN_NAME = "steam-epic-integration";
@@ -74,6 +77,51 @@ const STEAM_BUTTON_CSS = `
 }
 .se-badge-dot.se-visible {
     display: inline-block;
+}
+.se-dl-section {
+    margin: 12px 24px;
+    background: rgba(23, 29, 37, 0.75);
+    border: 1px solid #2a313c;
+    border-radius: 3px;
+    padding: 12px 16px;
+    font-family: "Motiva Sans", Arial, Helvetica, sans-serif;
+    color: #dcdedf;
+}
+.se-dl-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+.se-dl-title {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: #66c0f4;
+}
+.se-dl-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #23262e;
+    border: 1px solid #2d333d;
+    padding: 8px 12px;
+    border-radius: 2px;
+    margin-top: 6px;
+}
+.se-dl-bar-wrap {
+    width: 180px;
+    height: 6px;
+    background: #10151b;
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 0 12px;
+}
+.se-dl-bar {
+    height: 100%;
+    background: #1a9fff;
+    transition: width 0.3s ease;
 }
 `;
 
@@ -249,6 +297,8 @@ function getSteamPopupModules() {
     return null;
 }
 
+let lastSeenClaimTs = 0;
+
 function openClaimPopup(url) {
     callBackend("OpenClaimWindow", { url }).catch(() => {
         if (window.SteamClient?.System?.OpenInSystemBrowser) {
@@ -270,7 +320,6 @@ function healBlankSteamBrowser() {
 }
 
 function getExistingEpicShortcutsMap() {
-    // Returns Map<displayName, appid> for all existing "(Epic)" shortcuts in Steam's appStore
     const map = new Map();
     try {
         const apps = window.appStore?.allApps || [];
@@ -295,8 +344,6 @@ let artworkStreamGeneration = 0;
 
 async function streamEpicCoverArtInBackground(gamesWithIds, onProgressText) {
     const myGen = ++artworkStreamGeneration;
-
-    // 1. Trigger disk caching into ~/.steam/steam/userdata/*/config/grid/ via backend
     callBackend("CacheSteamGridArtwork", { items: gamesWithIds }).catch(() => {});
 
     if (!window.SteamClient?.Apps?.SetCustomArtworkForApp) return;
@@ -321,7 +368,6 @@ async function streamEpicCoverArtInBackground(gamesWithIds, onProgressText) {
                 url: item.tallCover,
             });
             if (res?.ok && res.base64) {
-                // eAssetType 0 = vertical Library Capsule, 3 = landscape Header
                 await window.SteamClient.Apps.SetCustomArtworkForApp(item.appid, res.base64, "jpg", 0);
                 doneSet[item.appid] = 1;
                 doneCount++;
@@ -341,7 +387,7 @@ async function streamEpicCoverArtInBackground(gamesWithIds, onProgressText) {
     }
 }
 
-async function applyEpicShortcutsToSteam(enable, onProgressText) {
+async function applyEpicShortcutsToSteam(enable, onProgressText, forceRefresh = false) {
     if (isSyncInProgress) return;
     isSyncInProgress = true;
     try {
@@ -372,7 +418,7 @@ async function applyEpicShortcutsToSteam(enable, onProgressText) {
         }
 
         if (onProgressText) onProgressText("Načítám Epic knihovnu…");
-        const lib = await callBackend("GetEpicLibrary");
+        const lib = await callBackend("GetEpicLibrary", { forceRefresh });
         if (!lib.authenticated) {
             if (onProgressText) onProgressText("Nejprve se přihlas k Epicu výše");
             return;
@@ -406,7 +452,6 @@ async function applyEpicShortcutsToSteam(enable, onProgressText) {
                         window.SteamClient.Apps.SetShortcutStartDir?.(appid, `"${startDir}"`);
                         window.SteamClient.Apps.SetShortcutLaunchOptions?.(appid, args);
                     }
-                    // Yield to Steam IPC every added shortcut so 350+ games never flood or crash Steam
                     await sleep(18);
                 } catch (_) {}
             }
@@ -433,7 +478,6 @@ async function applyEpicShortcutsToSteam(enable, onProgressText) {
             onProgressText(`Epic hry v Knihovně (${finalIds.length} her)`);
         }
 
-        // Stream cover art in the background without blocking the UI
         streamEpicCoverArtInBackground(artworkQueue, onProgressText);
     } finally {
         isSyncInProgress = false;
@@ -442,7 +486,7 @@ async function applyEpicShortcutsToSteam(enable, onProgressText) {
 
 // Pre-fetched state so popup renders in 0ms on click
 let preloadedState = {
-    auth: { authenticated: false, displayName: null },
+    auth: { authenticated: false, displayName: null, lastClaimTs: 0 },
     freeGames: [],
     ready: false,
 };
@@ -456,11 +500,11 @@ function notifyStateSubscribers() {
     }
 }
 
-async function refreshPreloadedState(dotEl) {
+async function refreshPreloadedState(dotEl, forceFree = false) {
     try {
         const [authRes, freeRes] = await Promise.all([
             callBackend("GetAuthStatus"),
-            callBackend("GetFreeGames"),
+            callBackend("GetFreeGames", { force: forceFree }),
         ]);
         preloadedState = {
             auth: authRes || { authenticated: false },
@@ -471,7 +515,120 @@ async function refreshPreloadedState(dotEl) {
             dotEl.classList.add("se-visible");
         }
         notifyStateSubscribers();
+
+        // Check if user just finished claiming a free game in the checkout window
+        const claimTs = authRes?.lastClaimTs || 0;
+        if (claimTs > lastSeenClaimTs && lastSeenClaimTs !== 0) {
+            lastSeenClaimTs = claimTs;
+            if (localStorage.getItem(STORAGE_KEY_SYNC) === "1" || getExistingEpicShortcutsMap().size > 0) {
+                applyEpicShortcutsToSteam(true, null, true);
+            }
+        } else if (lastSeenClaimTs === 0 && claimTs > 0) {
+            lastSeenClaimTs = claimTs;
+        }
     } catch (_) {}
+}
+
+// Native Steam Downloads page integration: renders Epic updates & active transfers inside Steam's Downloads tab
+let lastDownloadsCheckTs = 0;
+let cachedUpdatesData = null;
+
+async function injectEpicDownloadsSection(doc) {
+    const downloadsPage =
+        doc.querySelector("._1bq4x9pa4-9RLY-dXWUZTp") ||
+        doc.querySelector('[class*="DownloadsPage"]');
+    if (!downloadsPage) return;
+
+    const now = Date.now();
+    if (!cachedUpdatesData || now - lastDownloadsCheckTs > 4000) {
+        lastDownloadsCheckTs = now;
+        try {
+            cachedUpdatesData = await callBackend("GetEpicUpdates", { checkRemote: false });
+        } catch (_) {
+            return;
+        }
+    }
+
+    const pending = cachedUpdatesData?.pendingUpdates || [];
+    const active = cachedUpdatesData?.activeTransfers || [];
+    let container = downloadsPage.querySelector(".se-dl-section");
+
+    if (pending.length === 0 && active.length === 0) {
+        if (container) container.remove();
+        return;
+    }
+
+    if (!container) {
+        container = doc.createElement("div");
+        container.className = "se-dl-section";
+        const topBar = downloadsPage.querySelector("._373v1eWNyaPKhgnea9FZSt") || downloadsPage.firstChild;
+        if (topBar && topBar.nextSibling) {
+            downloadsPage.insertBefore(container, topBar.nextSibling);
+        } else {
+            downloadsPage.appendChild(container);
+        }
+    }
+
+    container.innerHTML = "";
+    const hdr = doc.createElement("div");
+    hdr.className = "se-dl-header";
+    const title = doc.createElement("div");
+    title.className = "se-dl-title";
+    title.textContent = `Epic Games Aktualizace & Stahování (${pending.length + active.length})`;
+    const checkBtn = doc.createElement("button");
+    checkBtn.className = "se-btn";
+    checkBtn.textContent = "Zkontrolovat aktualizace";
+    checkBtn.onclick = async () => {
+        checkBtn.textContent = "Kontroluji…";
+        cachedUpdatesData = await callBackend("GetEpicUpdates", { checkRemote: true });
+        injectEpicDownloadsSection(doc);
+    };
+    hdr.append(title, checkBtn);
+    container.appendChild(hdr);
+
+    for (const tr of active) {
+        const row = doc.createElement("div");
+        row.className = "se-dl-row";
+        const nameEl = doc.createElement("div");
+        nameEl.style.cssText = "font-weight:500;color:#fff;flex:1;";
+        nameEl.textContent = `${tr.title} (Epic)`;
+        const barWrap = doc.createElement("div");
+        barWrap.className = "se-dl-bar-wrap";
+        const bar = doc.createElement("div");
+        bar.className = "se-dl-bar";
+        bar.style.width = `${Math.min(100, Math.round(tr.progress || 0))}%`;
+        barWrap.appendChild(bar);
+        const infoEl = doc.createElement("div");
+        infoEl.className = "se-muted";
+        infoEl.textContent =
+            tr.status === "completed"
+                ? "Dokončeno (100%)"
+                : tr.status === "failed"
+                ? "Chyba stahování"
+                : `${Math.round(tr.progress || 0)}% ${tr.speed ? "• " + tr.speed : ""} ${tr.eta ? "• ETA " + tr.eta : ""}`;
+        row.append(nameEl, barWrap, infoEl);
+        container.appendChild(row);
+    }
+
+    for (const up of pending) {
+        if (active.some((a) => a.appName === up.appName)) continue;
+        const row = doc.createElement("div");
+        row.className = "se-dl-row";
+        const nameEl = doc.createElement("div");
+        nameEl.style.cssText = "font-weight:500;color:#fff;";
+        nameEl.textContent = `${up.title} (Epic) — dostupná verze ${up.latestVersion}`;
+        const updBtn = doc.createElement("button");
+        updBtn.className = "se-btn se-btn-primary";
+        updBtn.textContent = "Aktualizovat";
+        updBtn.onclick = async () => {
+            updBtn.textContent = "Spouštím…";
+            await callBackend("UpdateEpicGame", { app_name: up.appName, title: up.title });
+            lastDownloadsCheckTs = 0;
+            injectEpicDownloadsSection(doc);
+        };
+        row.append(nameEl, updBtn);
+        container.appendChild(row);
+    }
 }
 
 function createEpicPopupComponent(React, MenuContainer, getCloseFn) {
@@ -507,7 +664,7 @@ function createEpicPopupComponent(React, MenuContainer, getCloseFn) {
                         preloadedState.auth = st;
                         notifyStateSubscribers();
                         setSyncOn(true);
-                        await applyEpicShortcutsToSteam(true, setSyncText);
+                        await applyEpicShortcutsToSteam(true, setSyncText, true);
                     }
                 } catch (_) {}
             }, 2000);
@@ -648,6 +805,8 @@ function injectIntoWindow(win) {
     const doc = win.document;
     if (!doc || !doc.body) return;
 
+    injectEpicDownloadsSection(doc);
+
     const existing = doc.querySelector(".se-top-btn");
     if (existing) {
         placeButtonInSteamTopBar(doc, existing);
@@ -691,7 +850,6 @@ function injectIntoWindow(win) {
             if (retainedMenuInstance?.visible) retainedMenuInstance.Hide();
         });
 
-        // Pre-create hidden popup window (bCreateHidden + bRetainOnHide) just like Steam's Bell & Account menu!
         retainedMenuInstance = mgr.CreateContextMenuInstance(
             React.createElement(EpicPopup, null),
             btn,
@@ -716,10 +874,14 @@ function injectIntoWindow(win) {
         return retainedMenuInstance;
     }
 
-    // Pre-warm the popup window in idle time right after button mounts
     setTimeout(() => {
         ensurePrewarmedPopup();
     }, 600);
+
+    // Poll every 4 seconds for completed free-game claims and weekly free-game rotation
+    setInterval(() => {
+        refreshPreloadedState(dot, false);
+    }, 4000);
 
     btn.addEventListener("mousedown", (ev) => {
         ev.stopPropagation();
@@ -744,11 +906,10 @@ function injectIntoWindow(win) {
     });
 
     refreshPreloadedState(dot).then(() => {
-        // If user already had Epic library synced, resume background cover artwork streaming automatically
         const existingCount = getExistingEpicShortcutsMap().size;
         if (existingCount > 0) {
             localStorage.setItem(STORAGE_KEY_SYNC, "1");
-            applyEpicShortcutsToSteam(true, null);
+            applyEpicShortcutsToSteam(true, null, false);
         }
         const mods = getSteamPopupModules();
         const r = btn.getBoundingClientRect();

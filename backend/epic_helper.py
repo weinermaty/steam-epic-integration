@@ -3,10 +3,15 @@
 Backend helper & local daemon for steam-epic-integration.
 Handles:
 1. Fetching active Epic Games Store free games promotions (with offerId & namespace for direct 1-step checkout).
-2. Reading Epic Games library & auth status instantly from cached ~/.config/legendary/metadata/*.json (including tall/wide cover artwork URLs).
+2. Reading Epic Games library & auth status from ~/.config/legendary/metadata/*.json (with force_refresh support right after claiming a new game).
 3. Seamless 1-click Epic Games login via native WebKit2/pywebview window.
-4. Direct 1-step free game claim window: automatically exchanges Legendary OAuth token for a web session inside WebKit2 and redirects straight to the Epic checkout modal (`https://www.epicgames.com/store/purchase?...`), skipping store navigation and re-login so the user only confirms the order / captcha.
-5. Background Steam artwork downloader: caches Epic cover images into ~/.steam/steam/userdata/*/config/grid/<appid>p.jpg & <appid>_hero.jpg + returns base64 thumbnails on demand.
+4. Direct 1-step free game claim window using native GTK+WebKit2+Soup:
+   - Exchanges Legendary OAuth token for a 32-char opaque EPIC_BEARER_TOKEN (under WebKit's 4 KB cookie limit).
+   - Sets HttpOnly cookie via WebKit2.CookieManager, loads store.epicgames.com/en-US/cart to mint EPIC_EG1,
+     and immediately opens the direct `#/free-checkout` dialog ("Add to library" / hCaptcha, zero login prompt!).
+   - Automatically triggers a library refresh when the checkout completes or window closes.
+5. Epic Games Updates & Downloads tracking (`GetEpicUpdates`, `UpdateEpicGame`) integrated directly into Steam's Downloads page (`_1bq4x9pa4-9RLY-dXWUZTp`).
+6. Background Steam artwork downloader (`CacheSteamGridArtwork`, `GetArtworkBase64`).
 """
 
 import base64
@@ -16,6 +21,7 @@ import glob
 import http.server
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -41,6 +47,11 @@ ARTWORK_CACHE_DIR = os.path.expanduser("~/.cache/steam-epic-integration/artwork"
 
 LAST_DEBUG_REPORT = {}
 _CACHED_FREE = {"ts": 0.0, "data": None}
+_LAST_CLAIM_COMPLETED_TS = 0.0
+
+# Active & completed Epic downloads/updates tracked for Steam's Downloads page
+_ACTIVE_DOWNLOADS = {}  # appName -> {appName, title, status, progress, speed, eta, updatedAt}
+_DOWNLOADS_LOCK = threading.Lock()
 
 
 def find_legendary() -> str:
@@ -53,9 +64,9 @@ def find_legendary() -> str:
     return "legendary"
 
 
-def get_free_games() -> dict:
+def get_free_games(force: bool = False) -> dict:
     now = time.time()
-    if _CACHED_FREE["data"] and now - _CACHED_FREE["ts"] < 300:
+    if not force and _CACHED_FREE["data"] and now - _CACHED_FREE["ts"] < 300:
         return _CACHED_FREE["data"]
     try:
         req = urllib.request.Request(
@@ -146,13 +157,37 @@ def get_auth_status() -> dict:
             return {
                 "authenticated": True,
                 "displayName": data.get("displayName", "Epic User"),
+                "lastClaimTs": _LAST_CLAIM_COMPLETED_TS,
             }
         except Exception:
             pass
-    return {"authenticated": False, "displayName": None}
+    return {"authenticated": False, "displayName": None, "lastClaimTs": 0}
 
 
-def get_epic_library() -> dict:
+def refresh_epic_metadata() -> bool:
+    """Fetches newly claimed games from Epic servers into ~/.config/legendary/metadata/."""
+    try:
+        from legendary.core import LegendaryCore
+
+        core = LegendaryCore()
+        if core.login():
+            core.get_game_and_dlc_list(update_assets=True)
+            return True
+    except Exception:
+        try:
+            subprocess.run(
+                [find_legendary(), "list", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=25,
+            )
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def get_epic_library(force_refresh: bool = False) -> dict:
     auth = get_auth_status()
     helper_path = os.path.abspath(__file__)
     if not auth["authenticated"]:
@@ -163,6 +198,13 @@ def get_epic_library() -> dict:
             "games": [],
         }
 
+    meta_dir = os.path.expanduser("~/.config/legendary/metadata")
+    meta_files = glob.glob(os.path.join(meta_dir, "*.json"))
+
+    if force_refresh or not meta_files:
+        refresh_epic_metadata()
+        meta_files = glob.glob(os.path.join(meta_dir, "*.json"))
+
     installed_map = {}
     installed_json = os.path.expanduser("~/.config/legendary/installed.json")
     if os.path.isfile(installed_json):
@@ -172,29 +214,12 @@ def get_epic_library() -> dict:
         except Exception:
             installed_map = {}
 
-    meta_dir = os.path.expanduser("~/.config/legendary/metadata")
-    meta_files = glob.glob(os.path.join(meta_dir, "*.json"))
-
-    # If metadata directory is empty on first run, populate it once via legendary list
-    if not meta_files:
-        try:
-            subprocess.run(
-                [find_legendary(), "list", "--json"],
-                capture_output=True,
-                text=True,
-                timeout=25,
-            )
-            meta_files = glob.glob(os.path.join(meta_dir, "*.json"))
-        except Exception:
-            pass
-
     games = []
     for mf in meta_files:
         try:
             with open(mf, "r", encoding="utf-8") as f:
                 item = json.load(f)
             meta = item.get("metadata", {})
-            # Skip DLCs / non-game items without asset_infos
             if meta.get("mainGameItem") or not item.get("asset_infos"):
                 continue
             app_name = item.get("app_name", "")
@@ -219,14 +244,14 @@ def get_epic_library() -> dict:
                 or pics.get("DieselStoreFrontWide")
                 or tall_url
             )
+            inst_info = installed_map.get(app_name, {})
             games.append(
                 {
                     "appName": app_name,
                     "title": title,
                     "installed": app_name in installed_map,
-                    "installPath": installed_map.get(app_name, {}).get(
-                        "install_path", ""
-                    ),
+                    "installPath": inst_info.get("install_path", ""),
+                    "installedVersion": inst_info.get("version", ""),
                     "tallCover": tall_url,
                     "wideCover": wide_url,
                 }
@@ -240,8 +265,119 @@ def get_epic_library() -> dict:
         "authenticated": True,
         "displayName": auth["displayName"],
         "helperPath": helper_path,
+        "lastClaimTs": _LAST_CLAIM_COMPLETED_TS,
         "games": games,
     }
+
+
+def get_epic_updates_and_downloads(check_remote: bool = False) -> dict:
+    """
+    Returns installed Epic games that have an update available, plus any active/completed
+    Legendary downloads/updates so the frontend can render them in Steam's Downloads window.
+    """
+    updates = []
+    try:
+        from legendary.core import LegendaryCore
+
+        core = LegendaryCore()
+        if check_remote and core.login():
+            for plat in core.get_installed_platforms():
+                core.get_assets(update_assets=True, platform=plat)
+
+        installed_games = core.get_installed_list(include_dlc=False)
+        for ig in installed_games:
+            try:
+                latest_ver = core.get_asset(ig.app_name, platform=ig.platform).build_version
+            except Exception:
+                latest_ver = ig.version
+            has_update = bool(latest_ver and ig.version and latest_ver != ig.version)
+            updates.append(
+                {
+                    "appName": ig.app_name,
+                    "title": ig.title,
+                    "installedVersion": ig.version,
+                    "latestVersion": latest_ver,
+                    "hasUpdate": has_update,
+                    "installSize": ig.install_size,
+                }
+            )
+    except Exception:
+        pass
+
+    with _DOWNLOADS_LOCK:
+        transfers = list(_ACTIVE_DOWNLOADS.values())
+
+    return {
+        "ok": True,
+        "installedGames": updates,
+        "pendingUpdates": [u for u in updates if u["hasUpdate"]],
+        "activeTransfers": transfers,
+    }
+
+
+def _run_legendary_transfer(app_name: str, title: str, mode: str = "update", auto_launch: bool = False):
+    leg = find_legendary()
+    with _DOWNLOADS_LOCK:
+        _ACTIVE_DOWNLOADS[app_name] = {
+            "appName": app_name,
+            "title": title or app_name,
+            "mode": mode,
+            "status": "downloading",
+            "progress": 0.0,
+            "speed": "",
+            "eta": "",
+            "updatedAt": time.time(),
+        }
+
+    cmd = [leg, "update" if mode == "update" else "install", "-y", app_name]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        pct_re = re.compile(r"Progress:\s*([0-9.]+)%")
+        speed_re = re.compile(r"Download\s*-\s*([0-9.]+\s*[KMG]i?B/s)")
+        eta_re = re.compile(r"ETA:\s*([0-9:]+)")
+
+        for line in proc.stdout:
+            m_pct = pct_re.search(line)
+            m_spd = speed_re.search(line)
+            m_eta = eta_re.search(line)
+            if m_pct or m_spd or m_eta:
+                with _DOWNLOADS_LOCK:
+                    entry = _ACTIVE_DOWNLOADS.get(app_name)
+                    if entry:
+                        if m_pct:
+                            entry["progress"] = float(m_pct.group(1))
+                        if m_spd:
+                            entry["speed"] = m_spd.group(1)
+                        if m_eta:
+                            entry["eta"] = m_eta.group(1)
+                        entry["updatedAt"] = time.time()
+        proc.wait()
+        ok = proc.returncode == 0
+    except Exception:
+        ok = False
+
+    with _DOWNLOADS_LOCK:
+        entry = _ACTIVE_DOWNLOADS.get(app_name)
+        if entry:
+            entry["status"] = "completed" if ok else "failed"
+            entry["progress"] = 100.0 if ok else entry["progress"]
+            entry["speed"] = ""
+            entry["eta"] = ""
+            entry["updatedAt"] = time.time()
+
+    if ok and auto_launch:
+        subprocess.Popen(
+            [leg, "launch", app_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
 
 def _download_artwork_bytes(app_name: str, kind: str, url: str) -> bytes:
@@ -258,7 +394,11 @@ def _download_artwork_bytes(app_name: str, kind: str, url: str) -> bytes:
             pass
 
     sep = "&" if "?" in url else "?"
-    sized_url = f"{url}{sep}h=600&w=400&resize=1" if kind == "tall" else f"{url}{sep}h=430&w=920&resize=1"
+    sized_url = (
+        f"{url}{sep}h=600&w=400&resize=1"
+        if kind == "tall"
+        else f"{url}{sep}h=430&w=920&resize=1"
+    )
     try:
         req = urllib.request.Request(
             sized_url,
@@ -276,11 +416,6 @@ def _download_artwork_bytes(app_name: str, kind: str, url: str) -> bytes:
 
 
 def cache_steam_grid_artwork(items: list) -> dict:
-    """
-    Given a list of {"appid": int, "appName": str, "tallCover": str, "wideCover": str},
-    downloads images in parallel and writes them to ~/.steam/steam/userdata/*/config/grid/
-    (<appid>p.jpg, <appid>.jpg, <appid>_hero.jpg).
-    """
     grid_dirs = []
     for cfg in glob.glob(os.path.expanduser("~/.steam/steam/userdata/*/config")):
         gdir = os.path.join(cfg, "grid")
@@ -400,21 +535,48 @@ def sync_to_steam_shortcuts() -> dict:
     return {"ok": True, "syncedCount": len(entries), "paths": written}
 
 
-def launch_or_install_game(app_name: str) -> dict:
+def launch_or_install_game(app_name: str, title: str = "") -> dict:
     if not app_name or not all(c.isalnum() or c in "-_." for c in app_name):
         return {"ok": False, "error": "Invalid app_name"}
 
     leg = find_legendary()
     installed_json = os.path.expanduser("~/.config/legendary/installed.json")
     is_installed = False
+    game_title = title or app_name
     if os.path.isfile(installed_json):
         try:
             with open(installed_json, "r", encoding="utf-8") as f:
-                is_installed = app_name in json.load(f)
+                inst_data = json.load(f)
+                is_installed = app_name in inst_data
+                if is_installed and not title:
+                    game_title = inst_data[app_name].get("title", app_name)
         except Exception:
             pass
 
     if is_installed:
+        # Check if an update is required before launching
+        needs_update = False
+        try:
+            from legendary.core import LegendaryCore
+
+            core = LegendaryCore()
+            ig = core.get_installed_game(app_name)
+            if ig:
+                game_title = ig.title or game_title
+                asset = core.get_asset(app_name, platform=ig.platform)
+                if asset and asset.build_version and asset.build_version != ig.version:
+                    needs_update = True
+        except Exception:
+            pass
+
+        if needs_update:
+            threading.Thread(
+                target=_run_legendary_transfer,
+                args=(app_name, game_title, "update", True),
+                daemon=True,
+            ).start()
+            return {"ok": True, "action": "updating_and_launching", "appName": app_name}
+
         subprocess.Popen(
             [leg, "launch", app_name],
             stdout=subprocess.DEVNULL,
@@ -423,14 +585,23 @@ def launch_or_install_game(app_name: str) -> dict:
         )
         return {"ok": True, "action": "launched", "appName": app_name}
     else:
-        cmd = f'"{leg}" install -y "{app_name}" && "{leg}" launch "{app_name}"'
-        subprocess.Popen(
-            ["/bin/sh", "-c", cmd],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        threading.Thread(
+            target=_run_legendary_transfer,
+            args=(app_name, game_title, "install", True),
+            daemon=True,
+        ).start()
         return {"ok": True, "action": "installing", "appName": app_name}
+
+
+def update_epic_game(app_name: str, title: str = "") -> dict:
+    if not app_name or not all(c.isalnum() or c in "-_." for c in app_name):
+        return {"ok": False, "error": "Invalid app_name"}
+    threading.Thread(
+        target=_run_legendary_transfer,
+        args=(app_name, title or app_name, "update", False),
+        daemon=True,
+    ).start()
+    return {"ok": True, "action": "updating", "appName": app_name}
 
 
 def start_auth(code: str = "") -> dict:
@@ -476,31 +647,27 @@ def start_auth(code: str = "") -> dict:
 
 def open_claim_window(target_url: str) -> dict:
     """
-    Opens a compact checkout window pre-authenticated with the user's Legendary session!
-    1. Automatically accepts any pending Epic Store EULAs in the background via Epic's API.
-    2. Sets the `EPIC_BEARER_TOKEN` cookie on `.epicgames.com` using Legendary's access_token
-       and loads `store.epicgames.com/en-US/cart` so Epic's storefront mints the `EPIC_EG1`
-       store session cookie (preventing the '400 Account id is missing' error on checkout).
-    3. Automatically redirects straight to the direct purchase modal (`https://www.epicgames.com/store/purchase?...`).
+    Opens a compact GTK+WebKit2 checkout window pre-authenticated with the user's Legendary session!
+    - Exchanges Legendary's game token for a 32-char opaque EPIC_BEARER_TOKEN (without token_type=eg1,
+      so it is 32 bytes instead of 4401 bytes and passes WebKit2's 4096-byte cookie limit).
+    - Sets the HttpOnly cookie via WebKit2.CookieManager, loads store.epicgames.com/en-US/cart to mint
+      the EPIC_EG1 session cookie, and immediately opens the `#/free-checkout` modal ("Add to library").
+    - When the window closes, automatically refreshes Legendary metadata and increments lastClaimTs
+      so the Steam UI immediately adds the newly claimed game to the Steam Library!
     """
     if not target_url or "epicgames.com" not in target_url:
         return {"ok": False, "error": "Invalid store URL"}
 
-    access_token = ""
-    exchange_code = ""
-    account_id = ""
+    short_bearer_token = ""
     try:
+        import requests
         from legendary.core import LegendaryCore
 
         core = LegendaryCore()
         if core.login():
-            access_token = core.lgd.userdata.get("access_token", "")
             account_id = core.lgd.userdata.get("account_id", "")
-            tok = core.egs.get_game_token()
-            exchange_code = tok.get("code", "") if isinstance(tok, dict) else ""
-
-            # Auto-accept required Epic Store EULAs in the background if needed
-            if access_token and account_id:
+            # Auto-accept required Epic Store EULAs in the background
+            if account_id:
                 for eula_key in ("epicgames_privacy_policy_no_table", "egstore"):
                     try:
                         eula_url = f"https://eulatracking-public-service-prod-m.ol.epicgames.com/eulatracking/api/public/agreements/{eula_key}/account/{account_id}"
@@ -514,59 +681,110 @@ def open_claim_window(target_url: str) -> dict:
                                 core.egs.session.post(acc_url, timeout=5)
                     except Exception:
                         pass
+
+            # Mint 32-char opaque bearer token (fits under 4 KB cookie limit!)
+            code = core.egs.get_game_token().get("code", "")
+            if code:
+                resp = requests.post(
+                    "https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token",
+                    data={"grant_type": "exchange_code", "exchange_code": code},
+                    auth=(
+                        "34a02cf8f4414e29b15921876da36f9a",
+                        "daafbccc737745039dffe53d94fc76cf",
+                    ),
+                    timeout=8,
+                )
+                if resp.status_code == 200:
+                    short_bearer_token = resp.json().get("access_token", "")
     except Exception:
-        pass
+        short_bearer_token = ""
 
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":0")
-    storage_dir = os.path.expanduser("~/.config/legendary/webview_session")
-    os.makedirs(storage_dir, exist_ok=True)
+    cookie_db = os.path.expanduser("~/.config/legendary/webkit_cookies.sqlite")
 
     py_script = """
-import json, sys, webview
+import os, sys, urllib.request
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("WebKit2", "4.1")
+gi.require_version("Soup", "3.0")
+from gi.repository import Gtk, WebKit2, Soup, GLib
 
 target_url = sys.argv[1]
-access_token = sys.argv[2]
-exchange_code = sys.argv[3]
-storage_dir = sys.argv[4]
+short_token = sys.argv[2]
+cookie_db = sys.argv[3]
+daemon_port = sys.argv[4]
 
-boot_url = "https://store.epicgames.com/en-US/cart" if access_token else target_url
-win = webview.create_window("Epic Games — Potvrzení objednávky (0 Kč)", boot_url, width=560, height=740)
-state = {"stage": 0}
+ctx = WebKit2.WebContext.get_default()
+cm = ctx.get_cookie_manager()
+cm.set_persistent_storage(cookie_db, WebKit2.CookiePersistentStorage.SQLITE)
 
-def on_loaded():
-    if not access_token:
-        return
-    if state["stage"] == 0:
-        state["stage"] = 1
-        # Inject EPIC_BEARER_TOKEN cookie on .epicgames.com and reload cart so store.epicgames.com mints EPIC_EG1
-        js_stage1 = f'''
-        (async function() {{
-            document.cookie = "EPIC_BEARER_TOKEN=" + {json.dumps(access_token)} + "; domain=.epicgames.com; path=/; secure; SameSite=Lax";
-            try {{
-                await fetch("https://www.epicgames.com/id/api/csrf", {{ credentials: "include" }});
-                const m = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
-                const xsrf = m ? decodeURIComponent(m[1]) : "";
-                if ({json.dumps(exchange_code)}) {{
-                    await fetch("https://www.epicgames.com/id/api/exchange", {{
-                        method: "POST",
-                        credentials: "include",
-                        headers: {{ "Content-Type": "application/json", "X-XSRF-TOKEN": xsrf }},
-                        body: JSON.stringify({{ exchangeCode: {json.dumps(exchange_code)} }})
-                    }});
-                }}
-                await fetch("https://www.epicgames.com/id/api/authenticate", {{ credentials: "include" }});
-            }} catch (e) {{}}
-            window.location.replace("https://www.epicgames.com/id/login?noHostRedirect=true&client_id=875a3b57d3a640a6b7f9b4e883463ab4&redirectUrl=" + encodeURIComponent({json.dumps(target_url)}));
-        }})();
-        '''
+win = Gtk.Window(title="Epic Games — Vyzvednout zdarma (0 Kč)")
+win.set_default_size(560, 740)
+win.set_position(Gtk.WindowPosition.CENTER)
+
+wv = WebKit2.WebView.new_with_context(ctx)
+settings = wv.get_settings()
+settings.set_user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+win.add(wv)
+
+def notify_claim_done(*_):
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{daemon_port}/NotifyClaimCompleted",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
+    Gtk.main_quit()
+
+win.connect("destroy", notify_claim_done)
+
+navigated = {"done": False}
+
+def poll_cookies():
+    def cb(mgr, res, _):
         try:
-            win.evaluate_js(js_stage1)
+            cks = mgr.get_cookies_finish(res)
+            names = [x.get_name() for x in cks]
+            if "EPIC_EG1" in names and not navigated["done"]:
+                navigated["done"] = True
+                wv.load_uri(target_url)
+                win.show_all()
+                return
         except Exception:
             pass
+        if not navigated["done"]:
+            GLib.timeout_add(600, poll_cookies)
+    cm.get_cookies("https://store.epicgames.com/", None, cb, None)
+    return False
 
-win.events.loaded += on_loaded
-webview.start(private_mode=False, storage_path=storage_dir)
+if short_token:
+    ck = Soup.Cookie.new("EPIC_BEARER_TOKEN", short_token, ".epicgames.com", "/", 86400)
+    ck.set_secure(True)
+    ck.set_http_only(True)
+    ck.set_same_site_policy(Soup.SameSitePolicy.LAX)
+
+    def on_added(mgr, res, _):
+        try:
+            mgr.add_cookie_finish(res)
+        except Exception:
+            pass
+        wv.load_uri("https://store.epicgames.com/en-US/cart")
+        GLib.timeout_add(800, poll_cookies)
+        # Fallback: show window after 4s even if EPIC_EG1 takes longer
+        GLib.timeout_add(4000, lambda: win.show_all() or False)
+
+    cm.add_cookie(ck, None, on_added, None)
+else:
+    wv.load_uri(target_url)
+    win.show_all()
+
+Gtk.main()
 """
     subprocess.Popen(
         [
@@ -574,16 +792,27 @@ webview.start(private_mode=False, storage_path=storage_dir)
             "-c",
             py_script,
             target_url,
-            access_token,
-            exchange_code,
-            storage_dir,
+            short_bearer_token,
+            cookie_db,
+            str(DAEMON_PORT),
         ],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    return {"ok": True, "url": target_url, "autoLoggedIn": bool(access_token)}
+    return {"ok": True, "url": target_url, "autoLoggedIn": bool(short_bearer_token)}
+
+
+def notify_claim_completed() -> dict:
+    global _LAST_CLAIM_COMPLETED_TS
+    def _bg():
+        global _LAST_CLAIM_COMPLETED_TS
+        refresh_epic_metadata()
+        get_free_games(force=True)
+        _LAST_CLAIM_COMPLETED_TS = time.time()
+    threading.Thread(target=_bg, daemon=True).start()
+    return {"ok": True}
 
 
 def ensure_steamui_injected() -> bool:
@@ -608,19 +837,25 @@ def ensure_steamui_injected() -> bool:
 def dispatch_method(method: str, arg: str = "", extra: dict = None) -> dict:
     extra = extra or {}
     if method in ("free", "GetFreeGames"):
-        return get_free_games()
+        return get_free_games(force=bool(extra.get("force")))
     if method in ("status", "GetAuthStatus"):
         return get_auth_status()
     if method in ("library", "GetEpicLibrary"):
-        return get_epic_library()
+        return get_epic_library(force_refresh=bool(extra.get("forceRefresh")))
+    if method in ("updates", "GetEpicUpdates"):
+        return get_epic_updates_and_downloads(check_remote=bool(extra.get("checkRemote")))
+    if method in ("update_game", "UpdateEpicGame"):
+        return update_epic_game(arg, extra.get("title", ""))
     if method in ("sync", "SyncSteamShortcuts"):
         return sync_to_steam_shortcuts()
     if method in ("launch", "LaunchOrInstallEpicGame"):
-        return launch_or_install_game(arg)
+        return launch_or_install_game(arg, extra.get("title", ""))
     if method in ("auth", "AuthenticateEpic"):
         return start_auth(arg)
     if method in ("claim", "OpenClaimWindow"):
         return open_claim_window(arg)
+    if method == "NotifyClaimCompleted":
+        return notify_claim_completed()
     if method == "CacheSteamGridArtwork":
         return cache_steam_grid_artwork(extra.get("items") or [])
     if method == "GetArtworkBase64":
