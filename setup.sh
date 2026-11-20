@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-echo "==> 1. Odstraňuji duplicitní prázdný Flatpak Steam..."
-flatpak uninstall -y com.valvesoftware.Steam || true
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_DIR="$HOME/.local/share/millennium/plugins/steam-epic-integration"
 
-echo "==> 2. Instaluji Millennium do /usr/lib/millennium (zadej heslo k PC)..."
-sudo cp -r /tmp/millennium_dl/extracted/usr/* /usr/
-sudo chmod +x /usr/lib/millennium/libmillennium_pvs64 /usr/lib/millennium/libmillennium_luavm_x86 /usr/lib/millennium/libmillennium_luavm_x64
+if ! command -v legendary >/dev/null 2>&1 && [[ ! -x "$HOME/.local/bin/legendary" ]]; then
+  echo "Warning: 'legendary' not found. Install it with: pip install --user legendary-gl"
+fi
 
-echo "==> 3. Propojuji Millennium s tvým Steamem..."
-mkdir -p "$HOME/.steam/steam/ubuntu12_32" "$HOME/.steam/steam/ubuntu12_64" "$HOME/.steam/steam/steamrt64"
-ln -sf /usr/lib/millennium/libmillennium_bootstrap_x86.so   "$HOME/.steam/steam/ubuntu12_32/libXtst.so.6"
-ln -sf /usr/lib/millennium/libmillennium_bootstrap_hhx64.so "$HOME/.steam/steam/ubuntu12_64/libXtst.so.6"
-ln -sf /usr/lib/millennium/libmillennium_hhx64.so           "$HOME/.steam/steam/ubuntu12_64/libmillennium_hhx64.so"
-ln -sf /run/host/usr/lib/millennium/libmillennium_bootstrap_x64.so "$HOME/.steam/steam/steamrt64/libXtst.so.6"
+mkdir -p "$(dirname "$PLUGIN_DIR")"
+ln -sfn "$REPO_DIR" "$PLUGIN_DIR"
 
-echo "==> Hotovo! Nyní můžeš zapnout (nebo restartovat) Steam."
+echo "Linked $REPO_DIR -> $PLUGIN_DIR"
+echo "Enable 'Epic Games Integration' in Millennium settings and restart Steam."
